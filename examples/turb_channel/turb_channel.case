@@ -13,7 +13,7 @@
     "max_timestep": 1e-1,
     "numerics": {
         "time_order": 3,
-        "polynomial_order": 5,
+        "polynomial_order": 7,
         "dealias": true
     },
     "fluid": {
@@ -33,7 +33,7 @@
             "type": "gmres",
             "preconditioner": "hsmg",
             "projection_space_size": 20,
-            "absolute_tolerance": 1e-3,
+            "absolute_tolerance": 1e-4,
             "max_iterations": 800
         },
         "flow_rate_force": {
