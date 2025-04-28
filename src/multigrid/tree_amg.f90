@@ -212,6 +212,7 @@ contains
     allocate( node%interp_p( node%ndofs) )
     node%interp_r = 1.0_rp
     node%interp_p = 1.0_rp
+    node%xyz = 0.0_rp
   end subroutine tamg_node_init
 
   !> Wrapper for matrix vector product using the TreeAMG hierarchy structure

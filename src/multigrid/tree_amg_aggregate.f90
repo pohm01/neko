@@ -61,9 +61,10 @@ contains
   !! @param ly Number of dofs in y direction per element
   !! @param lz Number of dofs in z direction per element
   !! @param ne Number of elements
-  subroutine aggregate_finest_level(tamg, lx, ly, lz, ne)
+  subroutine aggregate_finest_level(tamg, lx, ly, lz, ne, xx, yy, zz)
     type(tamg_hierarchy_t), intent(inout) :: tamg
     integer, intent(in) :: lx, ly, lz, ne
+    real(kind=rp), intent(in) :: xx(:,:,:,:), yy(:,:,:,:), zz(:,:,:,:)
     integer :: i, j, k, l, nl, nt
     integer :: lid, gid_ptr
     integer :: lvl_id
@@ -87,6 +88,10 @@ contains
                 tamg%lvl(lvl_id)%nodes(l)%dofs(lid) = linear_index(i, j, k, l, &
                      lx, ly, lz)
 
+                tamg%lvl(lvl_id)%nodes(l)%xyz(1) = tamg%lvl(lvl_id)%nodes(l)%xyz(1) + xx(i, j, k, l)/nl
+                tamg%lvl(lvl_id)%nodes(l)%xyz(2) = tamg%lvl(lvl_id)%nodes(l)%xyz(2) + yy(i, j, k, l)/nl
+                tamg%lvl(lvl_id)%nodes(l)%xyz(3) = tamg%lvl(lvl_id)%nodes(l)%xyz(3) + zz(i, j, k, l)/nl
+
                 tamg%lvl(lvl_id)%nodes_dofs(gid_ptr) = linear_index(i,j,k,l,lx,ly,lz)
                 !tamg%lvl(lvl_id)%nodes_gids(gid_ptr) = l
                 tamg%lvl(lvl_id)%map_f2c(linear_index(i,j,k,l,lx,ly,lz)) = l
@@ -100,6 +105,298 @@ contains
     call aggregation_monitor_finest(lvl_id,nt,ne)
 
   end subroutine aggregate_finest_level
+
+  subroutine agg_greedy_coord_first_pass(naggs, max_aggs, n_elements, &
+       facet_neigh, offset_el, n_facet, is_aggregated, aggregate_size, &
+       mg, lvl)
+    integer, intent(inout):: naggs
+    integer, intent(in) :: max_aggs, n_elements
+    integer, intent(in) :: facet_neigh(:,:)
+    integer, intent(in) :: offset_el, n_facet
+    integer, intent(inout) :: is_aggregated(:)
+    integer, allocatable, intent(inout) :: aggregate_size(:)
+    type(tamg_hierarchy_t), intent(inout) :: mg
+    integer, intent(in) :: lvl
+    integer, allocatable :: as_tmp(:)
+    integer :: i, side, nhbr, nn
+    logical :: no_nhbr_agg, use_nhbr
+    real(kind=rp) :: dist_fact, avg_dist, dist
+    real(kind=rp) :: dx, dy, dz
+    dist_fact = 1.25_rp
+    associate(mgl => mg%lvl(lvl))
+    do i = 1, n_elements
+       if (is_aggregated(i) .eq. -1) then
+          !> find avg neighbor distance
+          nn = 0
+          avg_dist = 0.0_rp
+          do side = 1, n_facet
+             nhbr = facet_neigh(side, i) - offset_el
+             if ((nhbr .gt. 0).and.(nhbr .le. n_elements)) then!> if nhbr exists
+                dx = mgl%nodes(i)%xyz(1) - mgl%nodes(nhbr)%xyz(1)
+                dy = mgl%nodes(i)%xyz(2) - mgl%nodes(nhbr)%xyz(2)
+                dz = mgl%nodes(i)%xyz(3) - mgl%nodes(nhbr)%xyz(3)
+                dist = sqrt(dx*dx + dy*dy + dz*dz)
+                if (dist .eq. 0.0) call neko_error("coord zero....")
+                avg_dist = avg_dist + dist
+                nn = nn + 1
+             end if
+          end do!side
+          avg_dist = avg_dist / nn
+
+          !> check to see if any neighbors are aggregated
+          no_nhbr_agg = .true.
+          do side = 1, n_facet
+             nhbr = facet_neigh(side, i) - offset_el
+             use_nhbr = .false.
+             if ((nhbr .gt. 0).and.(nhbr .le. n_elements)) then!> if nhbr exists
+                dx = mgl%nodes(i)%xyz(1) - mgl%nodes(nhbr)%xyz(1)
+                dy = mgl%nodes(i)%xyz(2) - mgl%nodes(nhbr)%xyz(2)
+                dz = mgl%nodes(i)%xyz(3) - mgl%nodes(nhbr)%xyz(3)
+                dist = sqrt(dx*dx + dy*dy + dz*dz)
+                if (dist .lt. dist_fact*avg_dist) then
+                   use_nhbr = .true.
+                end if
+             end if
+             if (use_nhbr) then
+                if (is_aggregated(nhbr) .ne. -1) then
+                   no_nhbr_agg = .false.
+                end if
+             end if! use_nhbr
+          end do! s n_facet
+
+          !> no no neighbors are aggregated, create new aggregate
+          if (no_nhbr_agg) then
+             naggs = naggs + 1
+             is_aggregated(i) = naggs
+             if(size(aggregate_size).lt.naggs) then
+                allocate(as_tmp(naggs + 20))
+                as_tmp(1:size(aggregate_size)) = aggregate_size
+                call move_alloc(as_tmp, aggregate_size)
+             end if
+             aggregate_size(naggs) = 1
+             do side = 1, n_facet
+                nhbr = facet_neigh(side, i) - offset_el
+                use_nhbr = .false.
+                if ((nhbr .gt. 0).and.(nhbr .le. n_elements)) then!> if nhbr exists
+                   dx = mgl%nodes(i)%xyz(1) - mgl%nodes(nhbr)%xyz(1)
+                   dy = mgl%nodes(i)%xyz(2) - mgl%nodes(nhbr)%xyz(2)
+                   dz = mgl%nodes(i)%xyz(3) - mgl%nodes(nhbr)%xyz(3)
+                   dist = sqrt(dx*dx + dy*dy + dz*dz)
+                   if (dist .lt. dist_fact*avg_dist) then
+                      use_nhbr = .true.
+                   end if
+                end if
+                if (use_nhbr) then
+                   if (is_aggregated(nhbr) .eq. -1) then
+                      is_aggregated(nhbr) = naggs
+                      aggregate_size(naggs) = aggregate_size(naggs) + 1
+                   end if
+                end if! use_nhbr
+             end do! s n_facet
+          end if! no_nhbr_agg
+
+       end if! is_aggregated
+    end do
+    end associate
+  end subroutine agg_greedy_coord_first_pass
+
+  !> Second pass of a greedy aggregation
+  !> Loop through all unaggregated dofs and add them to a neighboring aggregate.
+  !> If no neighboring aggregates, create a new aggregate.
+  !! @param naggs The number of aggregates that have ben created
+  !! @param max_aggs The maximum number of aggregates to allow to be created
+  !! @param facet_neigh Dof adjacency information
+  !! @param offset_el Offset for facet_neigh
+  !! @param n_facet Max number of adjecnt dofs (ex. 6 if element is a cube)
+  !! @param is_aggregated Array containing aggregate info. Maps from dof id to agg id
+  !! @param aggregate_size Array containing the size of each aggregate
+  subroutine agg_greedy_coord_second_pass(naggs, max_aggs, n_elements, &
+       facet_neigh, offset_el, n_facet, is_aggregated, aggregate_size, &
+       mg, lvl)
+    integer, intent(inout):: naggs
+    integer, intent(in) :: max_aggs, n_elements
+    integer, intent(in) :: facet_neigh(:,:)
+    integer, intent(in) :: offset_el, n_facet
+    integer, intent(inout) :: is_aggregated(:)
+    integer, intent(inout) :: aggregate_size(:)
+    type(tamg_hierarchy_t), intent(inout) :: mg
+    integer, intent(in) :: lvl
+    integer :: i, side, nhbr
+    integer :: tnt_agg, tst_agg, tnt_size, tst_size
+    real(kind=rp) :: dist, tnt_dist, tst_dist
+    real(kind=rp) :: dx, dy, dz
+    associate(mgl => mg%lvl(lvl))
+    !> Add remaining unaggregated nodes to aggregates
+    do i = 1, n_elements
+       if (is_aggregated(i) .eq. -1) then
+          !> dof i is unaggregated. Check neighbors, add to closest neighbor
+          tnt_agg = -1
+          tnt_size = 999!TODO: replace with large number
+          tnt_dist = 9999999.0_rp
+          tst_agg = -1
+          tst_size = 999!TODO: replace with large number
+          tst_dist = 9999999.0_rp
+          do side = 1, n_facet
+             nhbr = facet_neigh(side, i) - offset_el
+             if ((nhbr .gt. 0).and.(nhbr .le. n_elements)) then!> if nhbr exists
+                if (is_aggregated(nhbr) .ne. -1) then
+                   dx = mgl%nodes(i)%xyz(1) - mgl%nodes(nhbr)%xyz(1)
+                   dy = mgl%nodes(i)%xyz(2) - mgl%nodes(nhbr)%xyz(2)
+                   dz = mgl%nodes(i)%xyz(3) - mgl%nodes(nhbr)%xyz(3)
+                   dist = sqrt(dx*dx + dy*dy + dz*dz)
+                   tst_agg = is_aggregated(nhbr)
+                   tst_size = aggregate_size(tst_agg)
+                   tst_dist = dist
+                   if (tst_size .lt. tnt_size) then
+                   !if (tst_dist .lt. tnt_dist) then
+                      tnt_size = tst_size
+                      tnt_dist = tst_dist
+                      tnt_agg = tst_agg
+                   end if
+                end if
+             end if
+          end do
+
+          if (tnt_agg .ne. -1) then
+             !> if neighbor aggregate found add to that aggregate
+             is_aggregated(i) = tnt_agg
+             aggregate_size(tnt_agg) = aggregate_size(tnt_agg) + 1
+          else
+             !> if none of the neignbors are aggregated. might as well make a new aggregate
+             naggs = naggs + 1
+             if (naggs .gt. size(aggregate_size)) then!TODO: another movealoc here? Error? the max_aggs needs to change though...
+                call neko_error("Creating too many aggregates... something might be wrong... try increasing max_aggs")
+             end if
+             is_aggregated(i) = naggs
+             aggregate_size(naggs) = 1
+             !> Add neighbors to aggregate if unaggregated
+             do side = 1, n_facet
+                nhbr = facet_neigh(side, i) - offset_el
+                if ((nhbr .gt. 0).and.(nhbr .le. n_elements)) then!> if nhbr exists
+                   if (is_aggregated(nhbr) .eq. -1) then
+                      aggregate_size(naggs) = aggregate_size(naggs) + 1
+                      is_aggregated(nhbr) = naggs
+                   end if
+                end if
+             end do
+          end if
+
+       end if
+    end do
+    end associate
+  end subroutine agg_greedy_coord_second_pass
+
+!!!!!!!!!!  subroutine agg_chk_nhbr(my_id, naggs, n_elements, &
+!!!!!!!!!!       facet_neigh, offset_el, n_facet, is_aggregated, aggregate_size, &
+!!!!!!!!!!       mg, lvl)
+!!!!!!!!!!    integer, intent(inout) :: my_id
+!!!!!!!!!!    integer, intent(inout):: naggs
+!!!!!!!!!!    integer, intent(in) :: n_elements
+!!!!!!!!!!    integer, intent(in) :: facet_neigh(:,:)
+!!!!!!!!!!    integer, intent(in) :: offset_el, n_facet
+!!!!!!!!!!    integer, intent(inout) :: is_aggregated(:)
+!!!!!!!!!!    integer, allocatable, intent(inout) :: aggregate_size(:)
+!!!!!!!!!!    type(tamg_hierarchy_t), intent(in) :: mg
+!!!!!!!!!!    integer, intent(in) :: lvl
+!!!!!!!!!!    integer, allocatable :: as_tmp(:)
+!!!!!!!!!!    real(kind=rp) :: dist_fact, avg_dist, dist
+!!!!!!!!!!    real(kind=rp) :: dx, dy, dz
+!!!!!!!!!!    integer :: s, nhbr, nn
+!!!!!!!!!!    logical :: no_nhbr_agg, use_nhbr
+!!!!!!!!!!    integer :: i
+!!!!!!!!!!    do i = 1, n_elements
+!!!!!!!!!!      if (is_aggregated(i) .eq. -1) then
+!!!!!!!!!!        my_id = i
+!!!!!!!!!!
+!!!!!!!!!!!!!!!!!    dist_fact = 100000.5_rp
+!!!!!!!!!!!!!!!!!    nn = 0
+!!!!!!!!!!!!!!!!!    avg_dist = 0.0_rp
+!!!!!!!!!!!!!!!!!    associate(mgl => mg%lvl(lvl))
+!!!!!!!!!!!!!!!!!    do s = 1, n_facet
+!!!!!!!!!!!!!!!!!       nhbr = facet_neigh(s, my_id) - offset_el
+!!!!!!!!!!!!!!!!!       if ((nhbr .gt. 0).and.(nhbr .le. n_elements)) then!> if nhbr exists
+!!!!!!!!!!!!!!!!!          dx = mgl%nodes(my_id)%xyz(1) - mgl%nodes(nhbr)%xyz(1)
+!!!!!!!!!!!!!!!!!          dy = mgl%nodes(my_id)%xyz(2) - mgl%nodes(nhbr)%xyz(2)
+!!!!!!!!!!!!!!!!!          dz = mgl%nodes(my_id)%xyz(3) - mgl%nodes(nhbr)%xyz(3)
+!!!!!!!!!!!!!!!!!          dist = sqrt(dx*dx + dy*dy + dz*dz)
+!!!!!!!!!!!!!!!!!          if (dist .eq. 0.0) call neko_error("coord zero....")
+!!!!!!!!!!!!!!!!!          avg_dist = avg_dist + dist
+!!!!!!!!!!!!!!!!!          nn = nn + 1
+!!!!!!!!!!!!!!!!!       end if
+!!!!!!!!!!!!!!!!!    end do
+!!!!!!!!!!!!!!!!!    !if (nn .eq. 0) call neko_error("AGG FAIL: no nhbr")
+!!!!!!!!!!!!!!!!!    if (nn .eq. 0) then
+!!!!!!!!!!!!!!!!!       avg_dist = 0.0_rp
+!!!!!!!!!!!!!!!!!    else
+!!!!!!!!!!!!!!!!!       avg_dist = avg_dist / nn
+!!!!!!!!!!!!!!!!!    end if
+!!!!!!!!!!!!!!!!!
+!!!!!!!!!!    no_nhbr_agg = .true.
+!!!!!!!!!!    nn = 0
+!!!!!!!!!!    do s = 1, n_facet
+!!!!!!!!!!       nhbr = facet_neigh(s, my_id) - offset_el
+!!!!!!!!!!       use_nhbr = .false.
+!!!!!!!!!!       if ((nhbr .gt. 0).and.(nhbr .le. n_elements)) then!> if nhbr exists
+!!!!!!!!!!!!!!!!!          dx = mgl%nodes(my_id)%xyz(1) - mgl%nodes(nhbr)%xyz(1)
+!!!!!!!!!!!!!!!!!          dy = mgl%nodes(my_id)%xyz(2) - mgl%nodes(nhbr)%xyz(2)
+!!!!!!!!!!!!!!!!!          dz = mgl%nodes(my_id)%xyz(3) - mgl%nodes(nhbr)%xyz(3)
+!!!!!!!!!!!!!!!!!          dist = sqrt(dx*dx + dy*dy + dz*dz)
+!!!!!!!!!!!!!!!!!          !> if nhbr is significantly farther than average
+!!!!!!!!!!!!!!!!!          !> then we will not consider it as a nhbr
+!!!!!!!!!!!!!!!!!          if (dist .ge. dist_fact*avg_dist) then
+!!!!!!!!!!!!!!!!!             use_nhbr = .false.
+!!!!!!!!!!!!!!!!!          else
+!!!!!!!!!!!!!!!!!             use_nhbr = .true.
+!!!!!!!!!!!!!!!!!             nn = nn + 1
+!!!!!!!!!!!!!!!!!          end if
+!!!!!!!!!!          use_nhbr = .true.
+!!!!!!!!!!       end if
+!!!!!!!!!!       if (use_nhbr) then
+!!!!!!!!!!          if (is_aggregated(nhbr) .ne. -1) then
+!!!!!!!!!!             no_nhbr_agg = .false.
+!!!!!!!!!!          end if
+!!!!!!!!!!       end if
+!!!!!!!!!!    end do
+!!!!!!!!!!
+!!!!!!!!!!    !if ((nn.gt.0).and.(no_nhbr_agg)) then
+!!!!!!!!!!    if (no_nhbr_agg) then
+!!!!!!!!!!       naggs = naggs + 1
+!!!!!!!!!!       is_aggregated(my_id) = naggs
+!!!!!!!!!!       if(size(aggregate_size).lt.naggs) then
+!!!!!!!!!!          allocate(as_tmp(naggs + 20))
+!!!!!!!!!!          as_tmp(1:size(aggregate_size)) = aggregate_size
+!!!!!!!!!!          call move_alloc(as_tmp, aggregate_size)
+!!!!!!!!!!       end if
+!!!!!!!!!!       aggregate_size(naggs) = 1
+!!!!!!!!!!       do s = 1, n_facet
+!!!!!!!!!!          nhbr = facet_neigh(s, my_id) - offset_el
+!!!!!!!!!!          use_nhbr = .false.
+!!!!!!!!!!          if ((nhbr .gt. 0).and.(nhbr .le. n_elements)) then!> if nhbr exists
+!!!!!!!!!!!!!!!!             dx = mgl%nodes(my_id)%xyz(1) - mgl%nodes(nhbr)%xyz(1)
+!!!!!!!!!!!!!!!!             dy = mgl%nodes(my_id)%xyz(2) - mgl%nodes(nhbr)%xyz(2)
+!!!!!!!!!!!!!!!!             dz = mgl%nodes(my_id)%xyz(3) - mgl%nodes(nhbr)%xyz(3)
+!!!!!!!!!!!!!!!!             dist = sqrt(dx*dx + dy*dy + dz*dz)
+!!!!!!!!!!!!!!!!             !> if nhbr is significantly farther than average
+!!!!!!!!!!!!!!!!             !> then we will not consider it as a nhbr
+!!!!!!!!!!!!!!!!             if (dist .ge. dist_fact*avg_dist) then
+!!!!!!!!!!!!!!!!                use_nhbr = .false.
+!!!!!!!!!!!!!!!!             else
+!!!!!!!!!!!!!!!!                use_nhbr = .true.
+!!!!!!!!!!!!!!!!             end if
+!!!!!!!!!!             use_nhbr = .true.
+!!!!!!!!!!          end if
+!!!!!!!!!!          if (use_nhbr) then
+!!!!!!!!!!             if (is_aggregated(nhbr) .ne. -1) then
+!!!!!!!!!!                is_aggregated(nhbr) = naggs
+!!!!!!!!!!                aggregate_size(naggs) = aggregate_size(naggs) + 1
+!!!!!!!!!!             end if
+!!!!!!!!!!          end if
+!!!!!!!!!!       end do
+!!!!!!!!!!    end if
+!!!!!!!!!!!!!!!    end associate
+!!!!!!!!!!  end if
+!!!!!!!!!!end do
+!!!!!!!!!!  end subroutine agg_chk_nhbr
 
   !> First pass of a greedy aggregation
   !> Loop through all dofs and aggregate on dof that has all unaggregated neighbors
@@ -266,7 +563,7 @@ contains
              if (tst_agg .le. 0) call neko_error("Unaggregated element detected. We do not want to handle that here...")
              if (tst_agg .ne. tnt_agg) then
                 agg_added = .false.
-                do j = 1, 50!TODO: this hard-coded value
+                do j = 1, 250!TODO: this hard-coded value
                    if ((agg_nhbr(j,tnt_agg) .eq. tst_agg)) then
                       agg_added = .true.
                    else if ((agg_nhbr(j,tnt_agg).eq.-1).and.(.not.agg_added)) then
@@ -275,7 +572,7 @@ contains
                       n_agg_nhbr = max(n_agg_nhbr, j)
                    end if
                 end do! j
-                if (.not.agg_added) call neko_error("Aggregates have too many neighbors... probably. Or some other error.")
+                !!!!if (.not.agg_added) call neko_error("Aggregates have too many neighbors... probably. Or some other error.")
              end if
           end if
        end do! side
@@ -305,7 +602,7 @@ contains
        n_facet = 6 !> NEKO elements are hexes, thus have 6 face neighbors
        offset_el = tamg%msh%offset_el
     else
-       n_facet = 50!TODO: this hard-coded value. how many neighbors can there be?
+       n_facet = 250!TODO: this hard-coded value. how many neighbors can there be?
        offset_el = 0
     end if
 
@@ -321,21 +618,27 @@ contains
     aggregate_size = huge(i)!999999
 
     !> First pass of greedy aggregation.
-    call agg_greedy_first_pass(naggs, max_aggs, n_elements, &
+    call agg_greedy_coord_first_pass(naggs, max_aggs, n_elements, &
          facet_neigh, offset_el, n_facet, &
-         is_aggregated, aggregate_size)
+         is_aggregated, aggregate_size, tamg, lvl_id-1)
+    !call agg_greedy_first_pass(naggs, max_aggs, n_elements, &
+    !     facet_neigh, offset_el, n_facet, &
+    !     is_aggregated, aggregate_size)
 
     call aggregation_monitor_phase1(lvl_id, n_elements, naggs, is_aggregated)
 
     !> Second pass of greedy aggregation, adding unaggregated dofs to neighboring aggregates.
-    call agg_greedy_second_pass(naggs, max_aggs, n_elements, &
+    call agg_greedy_coord_second_pass(naggs, max_aggs, n_elements, &
          facet_neigh, offset_el, n_facet, &
-         is_aggregated, aggregate_size)
+         is_aggregated, aggregate_size, tamg, lvl_id-1)
+    !call agg_greedy_second_pass(naggs, max_aggs, n_elements, &
+    !     facet_neigh, offset_el, n_facet, &
+    !     is_aggregated, aggregate_size)
 
     call aggregation_monitor_phase2(lvl_id, n_elements, naggs, is_aggregated)
 
     if (.true.) then!> if needed on next level...
-       allocate( agg_nhbr(50, max_aggs*2) )!TODO: this hard-coded n_facet value (20)...
+       allocate( agg_nhbr(250, max_aggs*2) )!TODO: this hard-coded n_facet value (20)...
        agg_nhbr = -1
        call agg_fill_nhbr_info(agg_nhbr, n_agg_facet, n_elements, &
             facet_neigh, offset_el, n_facet, &
@@ -360,6 +663,16 @@ contains
           if (is_aggregated(i) .eq. l) then
              j = j+1
              tamg%lvl(lvl_id)%nodes(l)%dofs(j) = i
+
+             tamg%lvl(lvl_id)%nodes(l)%xyz(1) = &
+                tamg%lvl(lvl_id)%nodes(l)%xyz(1) + &
+                tamg%lvl(lvl_id-1)%nodes(i)%xyz(1)/aggregate_size(l)
+             tamg%lvl(lvl_id)%nodes(l)%xyz(2) = &
+                tamg%lvl(lvl_id)%nodes(l)%xyz(2) + &
+                tamg%lvl(lvl_id-1)%nodes(i)%xyz(2)/aggregate_size(l)
+             tamg%lvl(lvl_id)%nodes(l)%xyz(3) = &
+                tamg%lvl(lvl_id)%nodes(l)%xyz(3) + &
+                tamg%lvl(lvl_id-1)%nodes(i)%xyz(3)/aggregate_size(l)
 
              tamg%lvl(lvl_id)%nodes_dofs(gid_ptr) = i
              !tamg%lvl(lvl_id)%nodes_gids(gid_ptr) = l

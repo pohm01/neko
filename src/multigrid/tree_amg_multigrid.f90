@@ -135,7 +135,8 @@ contains
     call this%amg%init(ax, Xh, coef, msh, gs_h, nlvls, blst)
 
     !> Create level 1 (neko elements are level 0)
-    call aggregate_finest_level(this%amg, Xh%lx, Xh%ly, Xh%lz, msh%nelv)
+    call aggregate_finest_level(this%amg, Xh%lx, Xh%ly, Xh%lz, msh%nelv, &
+       coef%dof%x, coef%dof%y, coef%dof%z)
 
     !> Create the remaining levels
     allocate( agg_nhbr, SOURCE = msh%facet_neigh )
