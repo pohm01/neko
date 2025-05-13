@@ -62,7 +62,6 @@ module cheby
    contains
      procedure, pass(this) :: init => cheby_init
      procedure, pass(this) :: free => cheby_free
-     !procedure, pass(this) :: solve => cheby_solve
      procedure, pass(this) :: solve => cheby_impl
      procedure, pass(this) :: solve_coupled => cheby_solve_coupled
   end type cheby_t
@@ -147,7 +146,8 @@ contains
             call this%schwarz%compute(r, w)
             call copy(w, r, n)
          else
-            call this%M%solve(w, w, n)
+            call this%M%solve(r, w, n)
+            call copy(w, r, n)
          end if
 
          wtw = glsc3(w, coef%mult, w, n)
@@ -158,13 +158,13 @@ contains
       call ax%compute(w, d, coef, x%msh, x%Xh)
       call gs_h%op(w, n, GS_OP_ADD)
       call blst%apply(w, n)
-      !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!call this%M%solve(w, w, n)
-         if (associated(this%schwarz)) then
+      if (associated(this%schwarz)) then
          call this%schwarz%compute(r, w)
          call copy(w, r, n)
-         else
-         call this%M%solve(w, w, n)
-         end if
+      else
+         call this%M%solve(r, w, n)
+         call copy(w, r, n)
+      end if
 
       dtw = glsc3(d, coef%mult, w, n)
       dtd = glsc3(d, coef%mult, d, n)
@@ -301,12 +301,6 @@ contains
          this%zero_initial_guess = .false.
       end if
 
-      rtr = glsc3(r, coef%mult, r, n)
-      rnorm = sqrt(rtr) * norm_fac
-      ksp_results%res_start = rnorm
-      ksp_results%res_final = rnorm
-      ksp_results%iter = 0
-
       ! First iteration
       if (associated(this%schwarz)) then
          call this%schwarz%compute(d, r)
@@ -341,17 +335,6 @@ contains
          call add2( x%x, d, n)
       end do
 
-!      ! calculate residual
-!      call copy(r, f, n)
-!      call ax%compute(w, x%x, coef, x%msh, x%Xh)
-!      call gs_h%op(w, n, GS_OP_ADD)
-!      call blst%apply(w, n)
-!      call sub2(r, w, n)
-!      rtr = glsc3(r, coef%mult, r, n)
-!      rnorm = sqrt(rtr) * norm_fac
-!      ksp_results%res_final = rnorm
-!      ksp_results%iter = iter
-!      ksp_results%converged = this%is_converged(iter, rnorm)
     end associate
   end function cheby_impl
 
