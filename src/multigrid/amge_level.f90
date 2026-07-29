@@ -1,6 +1,8 @@
 module amge_level
   use num_types, only : i4, rp
+  use utils, only : neko_error
   use matrix, only : matrix_t
+  use amge_gs, only : amge_gs_t
   use amge_topology, only : macro_mesh_t
   implicit none
   private
@@ -43,12 +45,15 @@ module amge_level
 
   !> A numerical level of the AMGe hierarchy.
   type, public :: amge_level_t
-     integer :: idx                               !< level index in hierarchy
-     type(macro_mesh_t) :: mmsh                   !< level mesh (entity tables)
-     integer(i4), allocatable :: elm_vtx_ptr(:)   !< CSR dof list per element
+     integer :: idx                             !< level index in hierarchy
+     type(macro_mesh_t) :: mmsh                 !< level mesh (entity tables)
+     integer(i4), allocatable :: elm_vtx_ptr(:) !< CSR dof list per element
      integer(i4), allocatable :: elm_vtx_idx(:)
-     type(matrix_t), allocatable :: AM(:)         !< local matrix per element
-     type(amge_level_transfer_t) :: tr           !< transfer to the finer level
+     type(matrix_t), allocatable :: AM(:) !< local matrix per element
+     logical :: topo_done = .true.        !< mmsh and topo info filled
+     type(amge_level_transfer_t) :: tr    !< transfer to the finer level
+     type(amge_gs_t) :: gsh               !< gather-scatter on level
+     logical :: gsh_ready = .false.
      !! Workspace vectors on level
      type(amge_vec_t) :: x !< Element-local solution vector (Assembled)
      type(amge_vec_t) :: b !< Element-local RHS (Assembled)
@@ -75,15 +80,36 @@ contains
   !! Needs AM to already be filled
   subroutine amge_level_data_init(this)
     class(amge_level_t), intent(inout) :: this
-    ! Allocate workspace vectors
-    call this%new_vec(this%x)
-    call this%new_vec(this%b)
-    call this%new_vec(this%r)
-    ! Allocate and fill multiplicity
-    call amge_valence(this)
-    ! Fill l1 diagonal
-    allocate(this%dl1(this%mmsh%n_verts))
-    call amge_setup_l1_diag(this, this%dl1)
+    logical, allocatable :: shared_vtx(:)
+    if (this%topo_done) then
+       ! Initialize gsh on level. shared_vtx is only seeded on level 0 once
+       ! amge_mesh_set_shared_from_dofmap is wired into the hierarchy build;
+       ! until then, fall back to "nothing is shared" (correct for a
+       ! single-rank run, and for any level whose mesh doesn't cross ranks).
+       if (allocated(this%mmsh%shared_vtx)) then
+          call this%gsh%init(this%nelm(), &
+               this%elm_vtx_ptr, this%elm_vtx_idx, &
+               this%mmsh%vert_id, this%mmsh%shared_vtx)
+       else
+          allocate(shared_vtx(this%mmsh%n_verts))
+          shared_vtx = .false.
+          call this%gsh%init(this%nelm(), &
+               this%elm_vtx_ptr, this%elm_vtx_idx, &
+               this%mmsh%vert_id, shared_vtx)
+       end if
+       this%gsh_ready = .true.
+       ! Allocate workspace vectors
+       call this%new_vec(this%x)
+       call this%new_vec(this%b)
+       call this%new_vec(this%r)
+       ! Allocate and fill multiplicity
+       call amge_valence(this)
+       ! Fill l1 diagonal
+       allocate(this%dl1(this%mmsh%n_verts))
+       call amge_setup_l1_diag(this, this%dl1)
+    else
+       call neko_error("AMGe level needs mesh info before init")
+    end if
   end subroutine amge_level_data_init
 
   !> Calculate the number of dofs on element e

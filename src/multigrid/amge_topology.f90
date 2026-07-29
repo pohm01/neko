@@ -108,6 +108,12 @@ module amge_topology
      integer(i4), allocatable :: face_el(:,:)     !< (2, n_face) incident elems
      integer(i4), allocatable :: face_nel(:)      !< 1 or 2
      integer(i4), allocatable :: vert_id(:)       !< local -> global vertex id
+     !> Is this vertex shared with another MPI rank? Inherited from the
+     !! finest-level (Q1) dofmap%shared_dof and propagated by
+     !! build_next_level, which is exact because a macrovertex IS a fine
+     !! vertex. Needed by the gather-scatter mapping to split dofs into
+     !! rank-local and communicated groups.
+     logical, allocatable :: shared_vtx(:)
    contains
      procedure, pass(this) :: free => macro_mesh_free
   end type macro_mesh_t
@@ -122,6 +128,7 @@ module amge_topology
      integer(i4) :: n_mface = 0               !< number of macrofaces
      logical, allocatable :: is_mv(:)         !< macrovertex flag per vertex
      integer(i4), allocatable :: vert_id(:)   !< local -> global vertex id
+     logical, allocatable :: shared_vtx(:)    !< inherited rank-shared flag
      type(macro_edge_t), allocatable :: medge(:)
      type(macro_face_t), allocatable :: mface(:)
      integer(i4) :: n_macro = 0               !< number of macroelements
@@ -280,8 +287,13 @@ contains
     this%n_edges = ne
     this%n_facets = nf
     this%n_macro = n_macro
-    allocate(this%vert_id(nv))
+    allocate(this%vert_id(nv), this%shared_vtx(nv))
     this%vert_id = mmsh%vert_id(1:nv)
+    if (allocated(mmsh%shared_vtx)) then
+       this%shared_vtx = mmsh%shared_vtx(1:nv)
+    else
+       this%shared_vtx = .false.
+    end if
 
     ! ---------------- phase 2: exposed facets + labels --------------------
     allocate(exposed(nf), face_lab(2, nf), face_labkey(nf))
@@ -628,9 +640,16 @@ contains
     mmshC%n_elem = this%n_macro
     mmshC%n_edge = this%n_medge
     mmshC%n_face = this%n_mface
-    allocate(mmshC%vert_id(cnt))
+    allocate(mmshC%vert_id(cnt), mmshC%shared_vtx(cnt))
+    mmshC%shared_vtx = .false.
     do v = 1, this%n_verts
-       if (cidx(v) .gt. 0) mmshC%vert_id(cidx(v)) = this%vert_id(v)
+       if (cidx(v) .gt. 0) then
+          mmshC%vert_id(cidx(v)) = this%vert_id(v)
+          ! a macrovertex IS a fine vertex, so its shared status is
+          ! inherited verbatim -- no communication needed to determine it
+          if (allocated(this%shared_vtx)) &
+               mmshC%shared_vtx(cidx(v)) = this%shared_vtx(v)
+       end if
     end do
     allocate(mmshC%edge_vtx(2, max(this%n_medge, 1)))
     do k = 1, this%n_medge
@@ -686,6 +705,7 @@ contains
     if (allocated(this%face_el)) deallocate(this%face_el)
     if (allocated(this%face_nel)) deallocate(this%face_nel)
     if (allocated(this%vert_id)) deallocate(this%vert_id)
+    if (allocated(this%shared_vtx)) deallocate(this%shared_vtx)
     this%n_verts = 0; this%n_elem = 0; this%n_face = 0; this%n_edge = 0
   end subroutine macro_mesh_free
 
@@ -696,6 +716,7 @@ contains
     integer(i4) :: k
     if (allocated(this%is_mv)) deallocate(this%is_mv)
     if (allocated(this%vert_id)) deallocate(this%vert_id)
+    if (allocated(this%shared_vtx)) deallocate(this%shared_vtx)
     if (allocated(this%medge)) then
        do k = 1, this%n_medge
           if (allocated(this%medge(k)%chain)) deallocate(this%medge(k)%chain)

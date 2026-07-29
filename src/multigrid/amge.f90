@@ -15,6 +15,7 @@ module amge
        amge_gather, amge_scatter_add, amge_gs_placeholder, &
        assemble_dense, build_p_dense, check_transition, check_invariants, &
        amge_fill_AM_from_ax, q1_hex
+  use amge_gs, only : amge_mesh_set_shared_from_dofmap
   implicit none
   private
 
@@ -170,7 +171,7 @@ contains
     call lvl%new_vec(rt)
     do it = 1, nu
        call amge_apply(lvl, u, rt)
-       call amge_gs_placeholder(lvl, rt)
+       call lvl%gsh%op(rt%x)
        rt%x = bt%x - rt%x
        do e = 1, lvl%nelm()
           off = lvl%elm_vtx_ptr(e)
@@ -180,7 +181,7 @@ contains
              end if
           end do
        end do
-       call amge_gs_placeholder(lvl, u)
+       call lvl%gsh%op(u%x)
        call scale_by_valence(lvl, u)
     end do
     call rt%free()
@@ -204,6 +205,10 @@ contains
 
     ! Create finest level
     call amge_level_init_from_mesh(this%lvl(0), msh)
+    call amge_mesh_set_shared_from_dofmap( this%lvl(0)%mmsh%n_verts, &
+         this%lvl(0)%mmsh%n_elem, this%lvl(0)%elm_vtx_ptr, &
+         this%lvl(0)%elm_vtx_idx, coef%dof, &
+         this%lvl(0)%mmsh%shared_vtx)
     call amge_fill_AM_from_ax(this%lvl(0), ax, coef, Xh, msh, blst)
     call this%lvl(0)%data_init()
 
@@ -276,7 +281,7 @@ contains
          call calc_resid(lvl, lvl%r, lvl%x, lvl%b)
          call amge_restrict(this%lvl, l, lvl%r, lc%b)
          ! Assemble the per-macroelement contributions
-         call amge_gs_placeholder(lc, lc%b)
+         call lc%gsh%op(lc%b%x)
          call rzero(lc%x%x, lc%x%n_dofs)
        end associate
     end do
@@ -323,7 +328,7 @@ contains
     type(amge_vec_t), intent(in) :: b
     real(kind=rp), allocatable :: u(:)
     call amge_apply(lvl, x, r)
-    call amge_gs_placeholder(lvl, r)
+    call lvl%gsh%op(r%x)
     call add2s1(r%x, b%x, -1.0_rp, r%n_dofs)
   end subroutine calc_resid
 
