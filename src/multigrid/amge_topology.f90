@@ -74,7 +74,7 @@ module amge_topology
   use utils, only : neko_error
   implicit none
   private
-  public :: macro_mesh_init_hex
+  public :: macro_mesh_init_hex, macro_topology_build_next_level_owned
 
   !> A macroedge: an open or closed chain of vertices (local indices);
   !! chain(1) == chain(size(chain)) marks a closed loop (breakpoint at
@@ -396,6 +396,8 @@ contains
     do v = 1, nv
        if (vdeg(v) .eq. 0) cycle
        if (vdeg(v) .ne. 2 .or. vsig(v) .eq. -1) this%is_mv(v) = .true.
+       !TODO: This is a simple fix to force vertices to match between ranks.
+       !if (vdeg(v) .ne. 2 .or. vsig(v) .eq. -1 .or. this%shared_vtx(v)) this%is_mv(v) = .true.
     end do
 
     ! loop breakpoints
@@ -693,6 +695,189 @@ contains
        end do
     end do
   end subroutine macro_topology_build_next_level
+
+  !> Ownership-restricted variant of build_next_level, for the one
+  !! ghost-extended coarsening step (level 0 -> 1, ranks > 1). @a this was
+  !! built from an EXTENDED element list (this rank's local elements plus a
+  !! one vertex-layer ghost halo of neighbors' elements), so its labels are
+  !! GLOBAL macro ids and its vertex numbering has local vertices FIRST
+  !! (indices 1..n_verts_keep, identical to the unextended mesh's own
+  !! numbering -- see amge_ghost_exchange's caller) followed by ghost-only
+  !! vertices. This emits only the macroelements THIS rank owns.
+  !!
+  !! Two independent keep criteria (do not conflate them):
+  !!  * a macrovertex is kept iff it is BOTH a macrovertex (this%is_mv) AND
+  !!    one of my own local vertices (index <= n_verts_keep) -- a vertex can
+  !!    be forced is_mv purely by remote topology (e.g. a 3-rank corner)
+  !!    while still being a corner of one of my own elements that some
+  !!    owned macroelement needs numbered, so this is an INDEX cutoff, not
+  !!    an "is it touched by an owned macroelement" test.
+  !!  * a macroedge/macroface is kept iff at least one of its label
+  !!    components is one of MY macro ids (owned_lo, owned_hi]. This MUST be
+  !!    ownership-based, not vertex-index-based: two ghost elements from
+  !!    different remote ranks can be adjacent to each other and still have
+  !!    every facet corner <= n_verts_keep (e.g. at a multi-rank junction),
+  !!    so an index-only filter would wrongly keep that ghost-to-ghost facet
+  !!    and inject a foreign macro id into mmshC%face_el.
+  !! A kept face with only one label owned emits face_nel==1 with only the
+  !! owned side stored (in LOCAL numbering, label - owned_lo) -- the same
+  !! "looks like a physical boundary" ambiguity this rank's OWN level-0
+  !! facets already have, deliberately, since level 1->2 remains rank-local
+  !! and unprotected (out of scope for this fix).
+  !! @param n_verts_keep  this rank's own (unextended) vertex count
+  !! @param owned_lo, owned_hi  my macro ids are the range (owned_lo, owned_hi]
+  subroutine macro_topology_build_next_level_owned(this, mmshC, n_verts_keep, &
+                                                    owned_lo, owned_hi)
+    class(macro_topology_t), intent(in) :: this
+    type(macro_mesh_t), intent(inout) :: mmshC
+    integer(i4), intent(in) :: n_verts_keep, owned_lo, owned_hi
+    integer(i4), allocatable :: cidx(:), fidx(:), eidx(:)
+    logical, allocatable :: face_keep(:), edge_keep(:)
+    integer(i4) :: v, k, a, cnt, l1, l2
+    logical :: owned1, owned2
+
+    call mmshC%free()
+
+    ! ---- vertices: is_mv AND mine ----
+    allocate(cidx(this%n_verts))
+    cidx = 0
+    cnt = 0
+    do v = 1, n_verts_keep
+       if (this%is_mv(v)) then
+          cnt = cnt + 1
+          cidx(v) = cnt
+       end if
+    end do
+    mmshC%n_verts = cnt
+
+    ! ---- macrofaces: at least one label component owned ----
+    allocate(face_keep(this%n_mface), fidx(this%n_mface))
+    cnt = 0
+    do k = 1, this%n_mface
+       l1 = this%mface(k)%label(1); l2 = this%mface(k)%label(2)
+       owned1 = (l1 .gt. owned_lo) .and. (l1 .le. owned_hi)
+       owned2 = (l2 .gt. owned_lo) .and. (l2 .le. owned_hi)
+       face_keep(k) = owned1 .or. owned2
+       fidx(k) = 0
+       if (face_keep(k)) then
+          cnt = cnt + 1
+          fidx(k) = cnt
+       end if
+    end do
+    mmshC%n_face = cnt
+
+    ! ---- macroedges: bound at least one kept macroface ----
+    allocate(edge_keep(this%n_medge), eidx(this%n_medge))
+    edge_keep = .false.
+    do k = 1, this%n_mface
+       if (.not. face_keep(k)) cycle
+       do a = 1, size(this%mface(k)%bnd_medge)
+          edge_keep(this%mface(k)%bnd_medge(a)) = .true.
+       end do
+    end do
+    cnt = 0
+    do k = 1, this%n_medge
+       eidx(k) = 0
+       if (edge_keep(k)) then
+          cnt = cnt + 1
+          eidx(k) = cnt
+       end if
+    end do
+    mmshC%n_edge = cnt
+    mmshC%n_elem = owned_hi - owned_lo
+
+    allocate(mmshC%vert_id(max(mmshC%n_verts,1)), mmshC%shared_vtx(max(mmshC%n_verts,1)))
+    mmshC%shared_vtx = .false.
+    do v = 1, n_verts_keep
+       if (cidx(v) .gt. 0) then
+          ! a macrovertex IS a fine vertex, so its shared status is
+          ! inherited verbatim from this rank's own dofmap-seeded flag --
+          ! no communication needed to determine it
+          mmshC%vert_id(cidx(v)) = this%vert_id(v)
+          if (allocated(this%shared_vtx)) mmshC%shared_vtx(cidx(v)) = this%shared_vtx(v)
+       end if
+    end do
+
+    ! defensive OR: a vertex on a kept face straddling owned/non-owned
+    ! macros is a rank interface too, regardless of what the inherited flag
+    ! (above) already says
+    do k = 1, this%n_mface
+       if (.not. face_keep(k)) cycle
+       l1 = this%mface(k)%label(1); l2 = this%mface(k)%label(2)
+       owned1 = (l1 .gt. owned_lo) .and. (l1 .le. owned_hi)
+       owned2 = (l2 .gt. owned_lo) .and. (l2 .le. owned_hi)
+       if ((owned1 .and. .not. owned2 .and. l2 .gt. 0) .or. &
+           (owned2 .and. .not. owned1 .and. l1 .gt. 0)) then
+          do a = 1, size(this%mface(k)%verts)
+             v = this%mface(k)%verts(a)
+             if (v .le. n_verts_keep) then
+                if (cidx(v) .gt. 0) mmshC%shared_vtx(cidx(v)) = .true.
+             end if
+          end do
+       end if
+    end do
+
+    allocate(mmshC%edge_vtx(2, max(mmshC%n_edge, 1)))
+    do k = 1, this%n_medge
+       if (.not. edge_keep(k)) cycle
+       associate (ch => this%medge(k)%chain)
+         mmshC%edge_vtx(1, eidx(k)) = min(cidx(ch(1)), cidx(ch(size(ch))))
+         mmshC%edge_vtx(2, eidx(k)) = max(cidx(ch(1)), cidx(ch(size(ch))))
+       end associate
+    end do
+
+    allocate(mmshC%face_el(2, max(mmshC%n_face, 1)), mmshC%face_nel(max(mmshC%n_face, 1)))
+    allocate(mmshC%face_vtx_ptr(mmshC%n_face + 1), mmshC%face_edge_ptr(mmshC%n_face + 1))
+    mmshC%face_vtx_ptr(1) = 0
+    mmshC%face_edge_ptr(1) = 0
+    do k = 1, this%n_mface
+       if (.not. face_keep(k)) cycle
+       cnt = 0
+       do a = 1, size(this%mface(k)%verts)
+          v = this%mface(k)%verts(a)
+          if (v .le. n_verts_keep) then
+             if (this%is_mv(v)) cnt = cnt + 1
+          end if
+       end do
+       mmshC%face_vtx_ptr(fidx(k) + 1) = mmshC%face_vtx_ptr(fidx(k)) + cnt
+       ! every bnd_medge of a KEPT face is, by construction above, itself
+       ! kept -- so this count needs no filtering, matching the unrestricted
+       ! build_next_level's own unconditional style
+       mmshC%face_edge_ptr(fidx(k) + 1) = mmshC%face_edge_ptr(fidx(k)) &
+            + size(this%mface(k)%bnd_medge)
+       mmshC%face_nel(fidx(k)) = 0
+       l1 = this%mface(k)%label(1); l2 = this%mface(k)%label(2)
+       if (l1 .gt. owned_lo .and. l1 .le. owned_hi) then
+          mmshC%face_nel(fidx(k)) = mmshC%face_nel(fidx(k)) + 1
+          mmshC%face_el(mmshC%face_nel(fidx(k)), fidx(k)) = l1 - owned_lo
+       end if
+       if (l2 .gt. owned_lo .and. l2 .le. owned_hi) then
+          mmshC%face_nel(fidx(k)) = mmshC%face_nel(fidx(k)) + 1
+          mmshC%face_el(mmshC%face_nel(fidx(k)), fidx(k)) = l2 - owned_lo
+       end if
+    end do
+
+    allocate(mmshC%face_vtx_idx(mmshC%face_vtx_ptr(mmshC%n_face + 1)))
+    allocate(mmshC%face_edge_idx(mmshC%face_edge_ptr(mmshC%n_face + 1)))
+    do k = 1, this%n_mface
+       if (.not. face_keep(k)) cycle
+       cnt = 0
+       do a = 1, size(this%mface(k)%verts)
+          v = this%mface(k)%verts(a)
+          if (v .le. n_verts_keep) then
+             if (this%is_mv(v)) then
+                cnt = cnt + 1
+                mmshC%face_vtx_idx(mmshC%face_vtx_ptr(fidx(k)) + cnt) = cidx(v)
+             end if
+          end if
+       end do
+       do a = 1, size(this%mface(k)%bnd_medge)
+          cnt = a
+          mmshC%face_edge_idx(mmshC%face_edge_ptr(fidx(k)) + cnt) = &
+               eidx(this%mface(k)%bnd_medge(a))
+       end do
+    end do
+  end subroutine macro_topology_build_next_level_owned
 
   !> Deallocate a level table set.
   subroutine macro_mesh_free(this)

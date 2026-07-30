@@ -10,6 +10,8 @@ module amge_utils
   use matrix, only : matrix_t
   use amge_topology, only : macro_topology_t
   use amge_level, only : amge_level_t, amge_vec_t, amge_level_transfer_t
+  use comm, only : NEKO_COMM, pe_rank, MPI_REAL_PRECISION
+  use mpi_f08, only : MPI_Allreduce, MPI_SUM, MPI_MAX, MPI_IN_PLACE, MPI_INTEGER
   implicit none
   private
 
@@ -22,6 +24,13 @@ module amge_utils
   public :: amge_gather, amge_scatter_add, amge_gs_placeholder
   public :: q1_hex
   public :: assemble_dense, build_p_dense, check_transition, check_invariants
+  public :: check_spsd, check_constant_reproduction
+  public :: assemble_dense_global, build_p_dense_global
+
+  !> Above this many global dofs, the cross-rank debug checks below skip
+  !! the dense O(glb_n^2) reconstruction (memory and Allreduce cost) rather
+  !! than silently attempting it on a real production-sized level.
+  integer(i4), parameter :: MAX_GLB_DEBUG_SIZE = 5000
   public :: amge_fill_AM_from_ax
 
 contains
@@ -165,33 +174,141 @@ contains
     end do
   end subroutine build_p_dense
 
+  !> Upper bound on the range of GLOBAL ids appearing in local_ids, across
+  !! every rank -- large enough to safely index a dense array by global id
+  !! directly (ids need not be dense/contiguous globally; unused rows/cols
+  !! are simply always zero).
+  function glb_size(local_ids) result(glb_n)
+    integer(i4), intent(in) :: local_ids(:)
+    integer(i4) :: glb_n
+    glb_n = maxval(local_ids)
+    call MPI_Allreduce(MPI_IN_PLACE, glb_n, 1, MPI_INTEGER, MPI_MAX, NEKO_COMM)
+  end function glb_size
+
+  !> Cross-rank dense assembly of a level's operator, indexed by GLOBAL
+  !! vertex id: each rank fills only the entries its own local elements
+  !! touch (at their global-id positions), then one Allreduce(SUM) totals
+  !! every rank's partial contribution at a shared (rank-boundary) id --
+  !! exactly the piece assemble_dense (rank-local only) is missing. Debug
+  !! only: O(glb_n^2) memory/communication, skipped above
+  !! MAX_GLB_DEBUG_SIZE.
+  !! @param ok  .false. if skipped for size; caller should not trust a_glb
+  subroutine assemble_dense_global(lvl, a_glb, ok)
+    type(amge_level_t), intent(in) :: lvl
+    real(rp), allocatable, intent(out) :: a_glb(:,:)
+    logical, intent(out) :: ok
+    integer(i4) :: e, n, i, j, li, lj, glb_n
+
+    glb_n = glb_size(lvl%mmsh%vert_id)
+    ok = glb_n .le. MAX_GLB_DEBUG_SIZE
+    if (.not. ok) return
+
+    allocate(a_glb(glb_n, glb_n))
+    a_glb = 0.0_rp
+    do e = 1, lvl%mmsh%n_elem
+       n = lvl%ndof_el(e)
+       do j = 1, n
+          lj = lvl%mmsh%vert_id(lvl%elm_vtx_idx(lvl%elm_vtx_ptr(e) + j))
+          do i = 1, n
+             li = lvl%mmsh%vert_id(lvl%elm_vtx_idx(lvl%elm_vtx_ptr(e) + i))
+             a_glb(li, lj) = a_glb(li, lj) + lvl%AM(e)%x(i, j)
+          end do
+       end do
+    end do
+    call MPI_Allreduce(MPI_IN_PLACE, a_glb, glb_n * glb_n, MPI_REAL_PRECISION, &
+         MPI_SUM, NEKO_COMM)
+  end subroutine assemble_dense_global
+
+  !> Cross-rank dense conforming prolongation (eq 62), indexed by GLOBAL
+  !! ids on both the fine (row) and coarse (column) side. Each rank's
+  !! per-macroelement sum-then-scale-by-winv is already the correctly
+  !! weighted PARTIAL contribution at a shared fine dof (winv itself is
+  !! now cross-rank-correct, see amge_gs_correct_shared_count); summing
+  !! those partials across ranks -- rather than using only one rank's
+  !! partial, as build_p_dense does -- recovers the true global P. Debug
+  !! only: see assemble_dense_global's caveats.
+  !! @param ok  .false. if skipped for size; caller should not trust p_glb
+  subroutine build_p_dense_global(lvf, lvc, p_glb, ok)
+    type(amge_level_t), intent(in) :: lvf, lvc
+    real(rp), allocatable, intent(out) :: p_glb(:,:)
+    logical, intent(out) :: ok
+    integer(i4) :: fv_loc, cv_loc, glb_nf, glb_nc, fv, cv
+    real(rp), allocatable :: p_loc(:,:)
+
+    glb_nf = glb_size(lvf%mmsh%vert_id)
+    glb_nc = glb_size(lvc%mmsh%vert_id)
+    ok = (glb_nf .le. MAX_GLB_DEBUG_SIZE) .and. (glb_nc .le. MAX_GLB_DEBUG_SIZE)
+    if (.not. ok) return
+
+    ! p_loc is already this rank's COMPLETE local partial (build_p_dense
+    ! itself sums every local macroelement touching a given (fine, coarse)
+    ! pair, then scales by winv) -- placing each of ITS entries once at
+    ! their global position is the correct per-rank contribution; looping
+    ! per-macroelement again here would double count any (fine, coarse)
+    ! pair touched by more than one local macroelement.
+    call build_p_dense(lvc%tr, p_loc)
+    allocate(p_glb(glb_nf, glb_nc))
+    p_glb = 0.0_rp
+    do cv_loc = 1, lvc%mmsh%n_verts
+       cv = lvc%mmsh%vert_id(cv_loc)
+       do fv_loc = 1, lvf%mmsh%n_verts
+          fv = lvf%mmsh%vert_id(fv_loc)
+          p_glb(fv, cv) = p_glb(fv, cv) + p_loc(fv_loc, cv_loc)
+       end do
+    end do
+    call MPI_Allreduce(MPI_IN_PLACE, p_glb, glb_nf * glb_nc, MPI_REAL_PRECISION, &
+         MPI_SUM, NEKO_COMM)
+  end subroutine build_p_dense_global
+
   !> Internal machine-precision checks of one transition.
   subroutine check_transition(lvf, lvc)
     type(amge_level_t), intent(in) :: lvf, lvc
     real(rp), allocatable :: af(:,:), ac(:,:), p(:,:), pap(:,:)
     real(rp) :: gerr, cerr, rerr, serr
-    integer(i4) :: m, a, q
-    call assemble_dense(lvf, af)
-    call assemble_dense(lvc, ac)
-    call build_p_dense(lvc%tr, p)
-    allocate(pap(lvc%tr%n_coarse, lvc%tr%n_coarse))
+    integer(i4) :: m, a, q, fv, cv, glb_nf, glb_nc
+    logical :: ok_a, ok_p
+
+    ! glb_size is collective (MPI_Allreduce): every rank must call it, even
+    ! though only rank 0 prints -- gating the CALL (not just the print) to
+    ! one rank would deadlock the others waiting in the reduction.
+    glb_nf = glb_size(lvf%mmsh%vert_id)
+    glb_nc = glb_size(lvc%mmsh%vert_id)
+    call assemble_dense_global(lvc, ac, ok_a)
+    call build_p_dense_global(lvf, lvc, p, ok_p)
+    if (.not. (ok_a .and. ok_p)) then
+       if (pe_rank .eq. 0) write(*, '("   [check] skipped: glb_size(fine) = ", I0, &
+            & "  glb_size(coarse) = ", I0, "  (cap = ", I0, ")")') &
+            glb_nf, glb_nc, MAX_GLB_DEBUG_SIZE
+       return
+    end if
+    call assemble_dense_global(lvf, af, ok_a)
+
+    allocate(pap(size(ac,1), size(ac,2)))
     pap = matmul(transpose(p), matmul(af, p))
     gerr = sqrt(sum((pap - ac)**2))
-    ! conformity: each PiTilde block equals the conforming P restricted
+    ! conformity: each rank's own PiTilde block must equal the TRUE global
+    ! conforming P restricted to its (translated) global positions -- with
+    ! p now cross-rank-summed, this is a genuine check that every rank's
+    ! trace maps agree with every other rank's on a shared macroedge/face
+    ! (eq. 56), not merely self-consistent with this rank's own data.
     cerr = 0.0_rp
     do m = 1, lvc%tr%n_melm
        associate (mp => lvc%tr%maps(m))
          do q = 1, size(mp%cdofs)
+            cv = lvc%mmsh%vert_id(mp%cdofs(q))
             do a = 1, size(mp%fdofs)
-               cerr = max(cerr, abs(mp%PiTilde%x(a, q) - p(mp%fdofs(a), mp%cdofs(q))))
+               fv = lvf%mmsh%vert_id(mp%fdofs(a))
+               cerr = max(cerr, abs(mp%PiTilde%x(a, q) - p(fv, cv)))
             end do
          end do
        end associate
     end do
     rerr = maxval(abs(sum(ac, dim=2)))
     serr = maxval(abs(ac - transpose(ac)))
-    write(*, '("   [check] ||P^T A P - A_c||_F = ", ES10.3, "  conformity = ", ES10.3, &
-         & "  rowsum = ", ES10.3, "  sym = ", ES10.3)') gerr, cerr, rerr, serr
+    if (pe_rank .eq. 0) then
+       write(*, '("   [check] ||P^T A P - A_c||_F = ", ES10.3, "  conformity = ", ES10.3, &
+            & "  rowsum = ", ES10.3, "  sym = ", ES10.3)') gerr, cerr, rerr, serr
+    end if
   end subroutine check_transition
 
   !> Invariants: every macroedge chain terminates at macrovertices (or is
@@ -222,6 +339,67 @@ contains
     write(*, '("   [check] chain endpoints are mv: ", L1, ' // &
          '";  rim chains inside face verts: ", L1)') ok1, ok2
   end subroutine check_invariants
+
+  !> SPSD check: eq.(3)/(6) of the AMGe theory note requires A^ell_M >= 0
+  !! at every level, for every macroelement. Reports the worst (most
+  !! negative) eigenvalue across all of a level's local matrices; should
+  !! be >= -tol (0, up to roundoff).
+  subroutine check_spsd(lvl)
+    type(amge_level_t), intent(in) :: lvl
+    real(rp) :: worst
+    integer(i4) :: e
+    worst = huge(1.0_rp)
+    do e = 1, lvl%nelm()
+       worst = min(worst, min_eigenvalue(lvl%AM(e)%x))
+    end do
+    write(*, '("   [check] SPSD: min eig over ", I0, " local matrices = ", ES10.3)') &
+         lvl%nelm(), worst
+  end subroutine check_spsd
+
+  !> Constant reproduction: Pi~_M must map the all-ones coarse vector to
+  !! the all-ones fine vector on every macroelement (eq. 50), i.e. every
+  !! row of PiTilde sums to 1. This is what lets the fine-level nullspace
+  !! (constant functions, A_K 1 = 0) propagate correctly up the hierarchy;
+  !! together with the rowsum check already in check_transition (A_c 1 = 0,
+  !! checked at the assembled/global level), a failure here versus there
+  !! isolates whether a discrepancy is in the interpolation itself or in
+  !! the coarse operator.
+  subroutine check_constant_reproduction(lvc)
+    type(amge_level_t), intent(in) :: lvc
+    real(rp) :: worst
+    integer(i4) :: m, a
+    worst = 0.0_rp
+    do m = 1, lvc%tr%n_melm
+       associate (mp => lvc%tr%maps(m))
+         do a = 1, size(mp%fdofs)
+            worst = max(worst, abs(sum(mp%PiTilde%x(a, :)) - 1.0_rp))
+         end do
+       end associate
+    end do
+    write(*, '("   [check] constant reproduction: max |rowsum(Pi~) - 1| = ", ES10.3)') worst
+  end subroutine check_constant_reproduction
+
+  !> Smallest eigenvalue of a symmetric matrix (LAPACK dsyev). Local copy
+  !! of amge_coarsen's own helper -- not worth a cross-module dependency
+  !! for one ~15-line function.
+  function min_eigenvalue(a) result(lam_min)
+    real(rp), intent(in) :: a(:,:)
+    real(rp) :: lam_min
+    real(rp), allocatable :: v(:,:), w(:), work(:)
+    integer(i4) :: n, info, lwork
+    n = size(a, 1)
+    if (n .eq. 0) then
+       lam_min = 0.0_rp
+       return
+    end if
+    allocate(v(n, n), w(n))
+    v = a
+    lwork = max(64 * n, 1)
+    allocate(work(lwork))
+    call dsyev('N', 'U', n, v, n, w, work, lwork, info)
+    if (info .ne. 0) call neko_error('amge_utils: dsyev failed (min_eigenvalue)')
+    lam_min = minval(w)
+  end function min_eigenvalue
 
   ! ================== fill from ax_t ==================
   !> SKETCH: filling the AMGe fine-level element matrices AM(e) from a real

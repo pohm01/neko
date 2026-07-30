@@ -142,28 +142,27 @@ contains
     v%x = 0.0_rp
   end subroutine amge_level_new_vec
 
-  !> Valence (duplication count) per unique dof: diag(G^T G).
+  !> Valence (duplication count) per unique dof: diag(G^T G). v = 1 ; gs ;
+  !! mult = 1/v -- gsh%op already sums every copy of a dof, same-rank AND
+  !! cross-rank, so a single gs of an all-ones vector gives the exact
+  !! global valence at every duplicated slot directly (see amge_gs.f90's
+  !! header comment for the rationale).
+  !!
+  !! winv (on lvl%tr, the transfer FROM this level's own finer neighbor)
+  !! is a DIFFERENT quantity -- macroelement-boundary-membership count of
+  !! a FINE (pre-coarsening) vertex, not this level's own element-duplication
+  !! count -- and is filled in coarsen_level_3d, which is the only place
+  !! that has both the fine level's fdofs lists and its own gs handle to
+  !! correct them cross-rank; see amge_gs_correct_shared_count.
   subroutine amge_valence(lvl)
     type(amge_level_t), intent(inout) :: lvl
-    real(rp), allocatable :: kappa(:)
-    integer(i4) :: e, p, off, n_dofs
-    allocate(kappa(lvl%mmsh%n_verts))
-    kappa = 0.0_rp
-    do e = 1, lvl%nelm()
-       off = lvl%elm_vtx_ptr(e)
-       do p = 1, lvl%ndof_el(e)
-          kappa(lvl%elm_vtx_idx(off + p)) = kappa(lvl%elm_vtx_idx(off + p)) + 1.0_rp
-       end do
-    end do
-
-    n_dofs = lvl%elm_vtx_ptr(lvl%nelm() + 1)
+    integer(i4) :: n_dofs
+    n_dofs = lvl%elm_vtx_ptr(lvl%nelm()+1)
+    if (allocated(lvl%mult)) deallocate(lvl%mult)
     allocate(lvl%mult(n_dofs))
-    do e = 1, lvl%nelm()
-       off = lvl%elm_vtx_ptr(e)
-       do p = 1, lvl%ndof_el(e)
-          lvl%mult(off + p) = 1.0_rp / kappa(lvl%elm_vtx_idx(off + p))
-       end do
-    end do
+    lvl%mult = 1.0_rp
+    call lvl%gsh%op(lvl%mult)
+    lvl%mult = 1.0_rp / lvl%mult
   end subroutine amge_valence
 
   ! ================== smoother ==================

@@ -14,6 +14,7 @@ module amge
   use amge_utils, only : amge_axpy, scale_by_valence, &
        amge_gather, amge_scatter_add, amge_gs_placeholder, &
        assemble_dense, build_p_dense, check_transition, check_invariants, &
+       check_spsd, check_constant_reproduction, &
        amge_fill_AM_from_ax, q1_hex
   use amge_gs, only : amge_mesh_set_shared_from_dofmap
   implicit none
@@ -190,17 +191,18 @@ contains
   ! ================== hierarchy ==================
 
   !> Initialize a macroelement amg hierarchy from a neko mesh_t
-  subroutine amge_hierarchy_init(this, ax, Xh, coef, msh, blst)
+  subroutine amge_hierarchy_init(this, ax, Xh, coef, msh, blst, nlvls)
     class(amge_hierarchy_t), intent(inout) :: this
     class(ax_t), intent(inout) :: ax
     type(coef_t), intent(inout) :: coef
     type(space_t), intent(inout) :: Xh
     type(mesh_t), target, intent(inout) :: msh
     type(bc_list_t), target, intent(inout) :: blst
+    integer, intent(in) :: nlvls
     type(macro_topology_t) :: topo
     integer, allocatable :: part(:)
     integer :: l, nm
-    this%nlvls = 2
+    this%nlvls = nlvls
     allocate(this%lvl(0:this%nlvls-1))
 
     ! Create finest level
@@ -211,6 +213,7 @@ contains
          this%lvl(0)%mmsh%shared_vtx)
     call amge_fill_AM_from_ax(this%lvl(0), ax, coef, Xh, msh, blst)
     call this%lvl(0)%data_init(0)
+    call check_spsd(this%lvl(0))
 
     ! Build the rest of the hierarchy
     do l = 1, this%nlvls-1
@@ -227,12 +230,15 @@ contains
        call this%lvl(l)%data_init(l)
        write(*, '("level ", I0, "->", I0, " dofs: ", I0, " -> ", I0)') (l-1), l, this%lvl(l)%tr%n_fine, this%lvl(l)%tr%n_coarse
        call check_transition(this%lvl(l-1), this%lvl(l))
+       call check_spsd(this%lvl(l))
+       call check_constant_reproduction(this%lvl(l))
        deallocate(part)
        if (this%lvl(l)%mmsh%n_verts <= this%min_grid_vert) exit
     end do
     if (l < this%nlvls-1) then
        this%nlvls = l+1
-       this%lvl = this%lvl(0:l)
+       !TODO: reduce allocation size of this%lvl
+       !this%lvl = this%lvl(0:l)
     end if
   end subroutine amge_hierarchy_init
 

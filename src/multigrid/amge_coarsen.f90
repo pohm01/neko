@@ -21,12 +21,37 @@ module amge_coarsen
   use num_types, only : i4, rp
   use utils, only : neko_error
   use matrix, only : matrix_t
-  use amge_topology, only : macro_topology_t, macro_mesh_t
+  use comm, only : NEKO_COMM, pe_size
+  use amge_topology, only : macro_topology_t, macro_mesh_t, macro_mesh_init_hex, &
+       macro_topology_build_next_level_owned
   use amge_level, only : amge_level_t
+  use amge_ghost, only : amge_ghost_t, amge_ghost_exchange, amge_ghost_extended_list
   implicit none
   private
 
   real(rp), parameter :: PINV_RTOL = 1e-12_rp
+
+  !> Toggle for the O(1)-per-macroelement debug checks in schur_extend and
+  !! the O(1)-per-macroedge/macroface checks in compute_edge_maps/
+  !! compute_face_maps (an eigendecomposition plus a few dense matmuls on
+  !! small local blocks each). Cheap relative to the rest of setup, but not
+  !! free; default on since this module is prototype/debug-stage code, but
+  !! easy to flip off for a build that wants to skip the extra work.
+  logical, public :: AMGE_DEBUG_CHECKS = .true.
+
+  !> Running worst-case diagnostics accumulated across a level's
+  !! macroelements by schur_extend, verifying eq.(48)-(53) of the AMGe
+  !! theory note (see [[amge_theory_reference]]): symmetry of S_dM (52),
+  !! interior stationarity of the harmonic extension (48), the "smart"
+  !! Schur-complement A_c against the naive Pi~^T A Pi~ (51), and SPSD-ness
+  !! of A_c (required by eq. 3/6).
+  type, public :: schur_check_t
+     real(rp) :: sym_err = 0.0_rp
+     real(rp) :: harmonic_err = 0.0_rp
+     real(rp) :: galerkin_err = 0.0_rp
+     real(rp) :: min_eig = huge(1.0_rp)
+     integer(i4) :: n_checked = 0
+  end type schur_check_t
 
   !> Small dense-block scratch type used only inside this module for the
   !! ragged per-entity trace maps (Q_E, Q_F).
@@ -54,6 +79,9 @@ contains
     integer(i4), allocatable :: adj_ptr(:), adj_idx(:), fill(:), frontier(:)
     logical, allocatable :: infr(:)
     integer(i4) :: ne, f, e, a, b, s, cnt, nfr, best, bscore, sc, q, c
+    integer(i4) :: i, j, tmp
+    integer(i4), allocatable :: rand_order(:)
+    real(kind=rp) :: r
 
     ne = lvl%mmsh%n_elem
     if (allocated(part)) deallocate(part)
@@ -79,10 +107,25 @@ contains
        end if
     end do
 
+    ! Initialize a random permutation
+    allocate( rand_order( ne ) )
+    do i = 1, ne
+       rand_order(i) = i
+    end do
+    ! Shuffle rand_order using Fisher-Yates algorithm
+    do i = ne, 2, -1
+       call random_number(r)
+       j = int(r * real(i, kind=rp)) + 1
+       tmp = rand_order(i)
+       rand_order(i) = rand_order(j)
+       rand_order(j) = tmp
+    end do
+
     part = 0
     n_macro = 0
     allocate(frontier(ne), infr(ne))
-    do s = 1, ne
+    do i = 1, ne
+       s = rand_order(i)
        if (part(s) .ne. 0) cycle
        n_macro = n_macro + 1
        part(s) = n_macro
@@ -129,11 +172,18 @@ contains
   !! macroelement assemble, fill Q_dM hierarchically (vertices -> edges
   !! -> faces), extend harmonically, form A_c = Q' S Q; emit the coarse
   !! numerical level (tables via build_next_level).
-  subroutine coarsen_level_3d(lvl, part, n_macro, topo, lvlC)
-    type(amge_level_t), intent(in) :: lvl
+  subroutine coarsen_level_3d(lvl, part, n_macro, topo, lvlC, use_ghost)
+    !> intent(inout), not (in): amge_gs_correct_shared_count below drives
+    !! lvl%gsh's comm object (transient send/recv buffers), not just reads
+    !! from lvl.
+    type(amge_level_t), intent(inout) :: lvl
     integer(i4), intent(in) :: part(:), n_macro
     type(macro_topology_t), intent(inout) :: topo
     type(amge_level_t), intent(inout) :: lvlC
+    !> Ghost-extend the rank-boundary topology/trace-map extraction for this
+    !! step (level 0 -> 1 only; see amge_ghost.f90). Ignored (treated as
+    !! .false.) whenever pe_size == 1, so a single-rank run is unaffected.
+    logical, optional, intent(in) :: use_ghost
 
     type(dblk_t), allocatable :: qe(:), qf(:)
     type(ivec_t), allocatable :: fb(:), fi(:)      ! face boundary/interior verts
@@ -144,10 +194,38 @@ contains
     real(rp), allocatable :: am(:,:), qdm(:,:)
     real(rp), allocatable :: w(:)
     integer(i4) :: m, e, k, a, q, v, nd, nb, nc, nmv
+    logical :: ghosted
+    type(schur_check_t) :: schk
+    type(amge_ghost_t) :: gh
+    type(amge_level_t) :: lvl_ext
+    integer(i4), allocatable :: hv_local(:,:), hv_ext(:,:), part_ext(:)
+    real(rp), allocatable :: amat_local(:,:), amat_ext(:,:)
+    integer(i4) :: moff, n_macro_topo
 
-    call topo%init_tables(lvl%mmsh, part, n_macro)
-    call compute_edge_maps(lvl, topo, qe)
-    call compute_face_maps(lvl, topo, fb, fi, qf)
+    ghosted = .false.
+    if (present(use_ghost)) ghosted = use_ghost .and. (pe_size > 1)
+    moff = 0
+
+    if (ghosted) then
+       ! one vertex-layer ghost exchange so this rank's topology/trace-map
+       ! extraction sees a complete neighborhood at every rank-boundary
+       ! entity -- see amge_ghost.f90 for the rationale.
+       call build_hv_amat_local(lvl, hv_local, amat_local)
+       call amge_ghost_exchange(NEKO_COMM%mpi_val, hv_local, amat_local, &
+                                part, n_macro, gh)
+       call amge_ghost_extended_list(gh, hv_local, amat_local, part, &
+                                     hv_ext, amat_ext, part_ext)
+       call build_ghost_ext_level(hv_ext, amat_ext, lvl%mmsh%shared_vtx, lvl_ext)
+       moff = gh%macro_offset
+       n_macro_topo = gh%n_macro_global
+       call topo%init_tables(lvl_ext%mmsh, part_ext, n_macro_topo)
+       call compute_edge_maps(lvl_ext, topo, qe)
+       call compute_face_maps(lvl_ext, topo, fb, fi, qf)
+    else
+       call topo%init_tables(lvl%mmsh, part, n_macro)
+       call compute_edge_maps(lvl, topo, qe)
+       call compute_face_maps(lvl, topo, fb, fi, qf)
+    end if
 
     ! member lists per macroelement
     allocate(melems(n_macro))
@@ -194,7 +272,16 @@ contains
 
     ! coarse level shell: CSR dof lists (elm_vtx_ptr/idx) + matrix_t blocks
     call lvlC%mmsh%free()
-    call topo%build_next_level(lvlC%mmsh)
+    if (ghosted) then
+       call macro_topology_build_next_level_owned(topo, lvlC%mmsh, &
+            lvl%mmsh%n_verts, moff, moff + n_macro)
+    else
+       call topo%build_next_level(lvlC%mmsh)
+    end if
+    if (lvlC%mmsh%n_verts .ne. nmv) then
+       call neko_error('coarsen_level_3d: coarse mesh vertex count ' // &
+            'disagrees with the transfer''s n_coarse')
+    end if
     allocate(lvlC%elm_vtx_ptr(n_macro + 1), lvlC%AM(n_macro))
     lvlC%elm_vtx_ptr(1) = 0
     allocate(g2l(lvl%mmsh%n_verts), markv(lvl%mmsh%n_verts))
@@ -239,8 +326,9 @@ contains
             call add_block(lvl, e, g2l, am)
          end do
 
-         ! incident entities, boundary set, coarse dofs
-         call incident_entities(topo, m, marke, myfaces, myedges)
+         ! incident entities, boundary set, coarse dofs. topo labels with
+         ! GLOBAL macro ids when ghost-extended (moff==0 otherwise).
+         call incident_entities(topo, m + moff, marke, myfaces, myedges)
          call boundary_set(topo, myfaces, myedges, mp%fdofs, markv, bset, cg)
          nb = size(bset%x)
          nc = size(cg%x)
@@ -263,7 +351,7 @@ contains
          call mp%PiTilde%init(nd, nc)
          call lvlC%AM(m)%init(nc, nc)
          call schur_extend(am, mp%fdofs, bset%x, markv, qdm, &
-                           mp%PiTilde%x, lvlC%AM(m)%x)
+                           mp%PiTilde%x, lvlC%AM(m)%x, schk)
 
          do a = 1, nc
             lvlC%elm_vtx_idx(lvlC%elm_vtx_ptr(m) + a) = mp%cdofs(a)
@@ -275,13 +363,92 @@ contains
          deallocate(am, qdm, bpos_of)
        end associate
     end do
+    ! w(v) so far only counts THIS RANK's own macroelements -- correct it
+    ! to the true cross-rank total at fine vertices lvl%mmsh%shared_vtx
+    ! flags as shared, using lvl's own (already-initialized) gs handle.
+    call lvl%gsh%correct_shared_count(lvl%elm_vtx_idx, w)
     where (w .gt. 0.0_rp)
        tr%winv = 1.0_rp / w
     elsewhere
        tr%winv = 1.0_rp
     end where
     end associate
+    if (ghosted) call gh%free()
+    if (AMGE_DEBUG_CHECKS .and. schk%n_checked .gt. 0) then
+       write(*, '("   [check] per-macroelement (n=", I0, "): S sym = ", ES10.3, &
+            & "  harmonic resid = ", ES10.3, "  |PiT^TAPi - Ac| = ", ES10.3, &
+            & "  min eig(Ac) = ", ES10.3)') schk%n_checked, schk%sym_err, &
+            schk%harmonic_err, schk%galerkin_err, schk%min_eig
+    end if
   end subroutine coarsen_level_3d
+
+  !> Reconstruct this level's global vertex ids (hex_t corner order) and
+  !! flat 8x8 element matrices from its own already-built CSR/AM data --
+  !! exactly what amge_ghost_exchange needs to send to neighboring ranks.
+  !! No new storage on amge_level_t: everything needed is already there.
+  subroutine build_hv_amat_local(lvl, hv, amat)
+    type(amge_level_t), intent(in) :: lvl
+    integer(i4), allocatable, intent(out) :: hv(:,:)
+    real(rp), allocatable, intent(out) :: amat(:,:)
+    integer(i4) :: e, k, off, nelv
+
+    nelv = lvl%mmsh%n_elem
+    allocate(hv(8, nelv), amat(64, nelv))
+    do e = 1, nelv
+       off = lvl%elm_vtx_ptr(e)
+       do k = 1, 8
+          hv(k, e) = lvl%mmsh%vert_id(lvl%elm_vtx_idx(off + k))
+       end do
+       amat(:, e) = reshape(lvl%AM(e)%x, [64])
+    end do
+  end subroutine build_hv_amat_local
+
+  !> Build a throwaway amge_level_t around a ghost-extended hex element
+  !! list (this rank's local elements, listed first in the SAME order used
+  !! to build lvl%mmsh, followed by ghost elements from neighboring ranks).
+  !! Used only to feed compute_edge_maps/compute_face_maps/init_tables a
+  !! complete neighborhood at a rank boundary -- never touches the
+  !! caller's own (unextended) level.
+  subroutine build_ghost_ext_level(hv_ext, amat_ext, shared_vtx_local, lvl_ext)
+    integer(i4), intent(in) :: hv_ext(:,:)
+    real(rp), intent(in) :: amat_ext(:,:)
+    logical, intent(in) :: shared_vtx_local(:)
+    type(amge_level_t), intent(inout) :: lvl_ext
+    integer(i4), allocatable :: g2l(:)
+    integer(i4) :: n_ext, e, k, off, v
+
+    n_ext = size(hv_ext, 2)
+    call macro_mesh_init_hex(lvl_ext%mmsh, n_ext, hv_ext)
+
+    ! shared_vtx isn't set by macro_mesh_init_hex; copy this rank's own
+    ! (dofmap-seeded) flag for local vertices, default .false. for
+    ! ghost-only vertices beyond them (fact: local vertices keep identical
+    ! numbering 1..size(shared_vtx_local), see build_ghost_ext_level's
+    ! caller comment on ordering).
+    allocate(lvl_ext%mmsh%shared_vtx(lvl_ext%mmsh%n_verts))
+    lvl_ext%mmsh%shared_vtx = .false.
+    lvl_ext%mmsh%shared_vtx(1:size(shared_vtx_local)) = shared_vtx_local
+
+    allocate(g2l(maxval(hv_ext)))
+    g2l = 0
+    do v = 1, lvl_ext%mmsh%n_verts
+       g2l(lvl_ext%mmsh%vert_id(v)) = v
+    end do
+
+    allocate(lvl_ext%elm_vtx_ptr(n_ext + 1))
+    allocate(lvl_ext%elm_vtx_idx(8 * n_ext))
+    allocate(lvl_ext%AM(n_ext))
+    lvl_ext%elm_vtx_ptr(1) = 0
+    do e = 1, n_ext
+       lvl_ext%elm_vtx_ptr(e + 1) = lvl_ext%elm_vtx_ptr(e) + 8
+       off = lvl_ext%elm_vtx_ptr(e)
+       do k = 1, 8
+          lvl_ext%elm_vtx_idx(off + k) = g2l(hv_ext(k, e))
+       end do
+       call lvl_ext%AM(e)%init(8, 8)
+       lvl_ext%AM(e)%x = reshape(amat_ext(:, e), [8, 8])
+    end do
+  end subroutine build_ghost_ext_level
 
   ! ================== trace maps ==================
 
@@ -299,11 +466,14 @@ contains
     real(rp), allocatable :: a(:,:), sm(:,:), piv(:,:)
     integer(i4) :: k, nch, nb, nf, i
     logical :: closed
+    real(rp) :: sym_err, min_eig
 
     allocate(qe(topo%n_medge))
     allocate(inchain(lvl%mmsh%n_verts), g2l(lvl%mmsh%n_verts))
     inchain = .false.
     g2l = 0
+    sym_err = 0.0_rp
+    min_eig = huge(1.0_rp)
     do k = 1, topo%n_medge
        associate (ch => topo%medge(k)%chain)
          nch = size(ch)
@@ -320,6 +490,13 @@ contains
          end do
          allocate(sm(nb, nb))
          call schur_onto_leading(a, nb, sm)
+         if (AMGE_DEBUG_CHECKS) then
+            ! eq.(31): S_E is a Schur complement of a symmetric matrix, so
+            ! it must be symmetric and PSD (the neighborhood energy (32)
+            ! cannot be negative).
+            sym_err = max(sym_err, maxval(abs(sm - transpose(sm))))
+            min_eig = min(min_eig, min_eigenvalue(sm))
+         end if
          ! harmonic along the chain: identity at breakpoints, interior
          ! rows = -pinv(S_FF) S_FC
          allocate(qe(k)%x(nb, merge(1, 2, closed)))
@@ -347,6 +524,10 @@ contains
          deallocate(a, sm)
        end associate
     end do
+    if (AMGE_DEBUG_CHECKS .and. topo%n_medge .gt. 0) then
+       write(*, '("   [check] Q_E (n=", I0, "): S_E sym = ", ES10.3, &
+            & "  min eig(S_E) = ", ES10.3)') topo%n_medge, sym_err, min_eig
+    end if
   end subroutine compute_edge_maps
 
   !> One Q_F per macroface, with a globally fixed sorted split of the
@@ -364,6 +545,8 @@ contains
     type(ivec_t) :: touching, dofs
     real(rp), allocatable :: a(:,:), sm(:,:), piv(:,:)
     integer(i4) :: k, nb, ni, i
+    real(rp) :: sym_err, min_eig
+    integer(i4) :: n_checked
 
     allocate(fb(topo%n_mface), fi(topo%n_mface), qf(topo%n_mface))
     allocate(mark(lvl%mmsh%n_verts), inface(lvl%mmsh%n_verts))
@@ -371,6 +554,9 @@ contains
     mark = .false.
     inface = .false.
     g2l = 0
+    sym_err = 0.0_rp
+    min_eig = huge(1.0_rp)
+    n_checked = 0
     do k = 1, topo%n_mface
        call face_split(topo, k, mark, fb(k), fi(k))
        nb = size(fb(k)%x)
@@ -392,6 +578,13 @@ contains
          end do
          allocate(sm(nb + ni, nb + ni), piv(ni, ni))
          call schur_onto_leading(a, nb + ni, sm)
+         if (AMGE_DEBUG_CHECKS) then
+            ! same rationale as compute_edge_maps: S_F is a Schur
+            ! complement of a symmetric matrix, so symmetric and PSD.
+            sym_err = max(sym_err, maxval(abs(sm - transpose(sm))))
+            min_eig = min(min_eig, min_eigenvalue(sm))
+            n_checked = n_checked + 1
+         end if
          call sym_pinv(sm(nb+1:nb+ni, nb+1:nb+ni), piv)
          qf(k)%x = -matmul(piv, sm(nb+1:nb+ni, 1:nb))
          do i = 1, size(mf%verts)
@@ -403,6 +596,10 @@ contains
          deallocate(a, sm, piv, lead)
        end associate
     end do
+    if (AMGE_DEBUG_CHECKS .and. n_checked .gt. 0) then
+       write(*, '("   [check] Q_F (n=", I0, "): S_F sym = ", ES10.3, &
+            & "  min eig(S_F) = ", ES10.3)') n_checked, sym_err, min_eig
+    end if
   end subroutine compute_face_maps
 
   !> Sorted boundary/interior vertex split of macroface k: boundary =
@@ -670,13 +867,21 @@ contains
   !> Interior harmonic extension and local Galerkin:
   !!   Xi = pinv(A_II) A_IB,  S = A_BB - A_BI Xi,
   !!   PiTilde = [Q ; -Xi Q],  A_c = Q' S Q.
-  subroutine schur_extend(am, dofs, bset, markv, qdm, pit, ac)
+  !! @param chk  running debug-check accumulator (updated in place; see
+  !!             schur_check_t and AMGE_DEBUG_CHECKS). Verifies, per
+  !!             macroelement, eq.(52) (S symmetry), eq.(48) (the harmonic
+  !!             extension's interior stationarity: A_{I_M,:} Pi~_M = 0),
+  !!             eq.(51) (the Schur-complement shortcut ac against the
+  !!             brute-force Pi~^T A Pi~), and eq.(3)/(6) (A_c SPSD).
+  subroutine schur_extend(am, dofs, bset, markv, qdm, pit, ac, chk)
     real(rp), intent(in) :: am(:,:), qdm(:,:)
     integer(i4), intent(in) :: dofs(:), bset(:)
     logical, intent(inout) :: markv(:)
     real(rp), intent(out) :: pit(:,:), ac(:,:)
+    type(schur_check_t), intent(inout) :: chk
     integer(i4), allocatable :: bp(:), ip(:)
     real(rp), allocatable :: piv(:,:), xi(:,:), s(:,:)
+    real(rp), allocatable :: resid(:,:), ac_bf(:,:)
     integer(i4) :: a, nd, nb, ni, ib, ii
 
     nd = size(dofs)
@@ -707,9 +912,38 @@ contains
        pit(bp, :) = qdm
        pit(ip(1:ni), :) = -matmul(xi, qdm)
        ac = matmul(transpose(qdm), matmul(s, qdm))
+
+       if (AMGE_DEBUG_CHECKS) then
+          ! eq.(52): S_dM must be symmetric (Schur complement of a
+          ! symmetric am).
+          chk%sym_err = max(chk%sym_err, maxval(abs(s - transpose(s))))
+          ! eq.(48): the interior values are the energy-minimizing
+          ! (harmonic) extension of the boundary trace, i.e. the discrete
+          ! Euler-Lagrange condition A_{I_M,:} Pi~_M = 0 must hold at the
+          ! constructed Pi~_M -- this is the optimality condition the
+          ! argmin in (48) actually asserts, checked directly rather than
+          ! trusted from the algebra.
+          allocate(resid(ni, size(pit, 2)))
+          resid = matmul(am(ip(1:ni), :), pit)
+          chk%harmonic_err = max(chk%harmonic_err, maxval(abs(resid)))
+          deallocate(resid)
+       end if
     else
        pit(bp, :) = qdm
        ac = matmul(transpose(qdm), matmul(am(bp, bp), qdm))
+    end if
+
+    if (AMGE_DEBUG_CHECKS) then
+       ! eq.(51): the Schur-complement shortcut above must equal the naive
+       ! (defining) Pi~^T A Pi~ -- an independent brute-force cross-check
+       ! of schur_extend's own algebra, not just a re-derivation of it.
+       allocate(ac_bf(size(ac,1), size(ac,2)))
+       ac_bf = matmul(transpose(pit), matmul(am, pit))
+       chk%galerkin_err = max(chk%galerkin_err, maxval(abs(ac_bf - ac)))
+       deallocate(ac_bf)
+       ! eq.(3)/(6): A_c must be SPSD.
+       chk%min_eig = min(chk%min_eig, min_eigenvalue(ac))
+       chk%n_checked = chk%n_checked + 1
     end if
   end subroutine schur_extend
 
@@ -842,6 +1076,28 @@ contains
        end if
     end do
   end subroutine sym_pinv
+
+  !> Smallest eigenvalue of a symmetric matrix (LAPACK dsyev, eigenvectors
+  !! not needed so 'N'). Debug-check helper: SPSD requires this to be >=
+  !! -tol for every locally-assembled/coarsened matrix.
+  function min_eigenvalue(a) result(lam_min)
+    real(rp), intent(in) :: a(:,:)
+    real(rp) :: lam_min
+    real(rp), allocatable :: v(:,:), w(:), work(:)
+    integer(i4) :: n, info, lwork
+    n = size(a, 1)
+    if (n .eq. 0) then
+       lam_min = 0.0_rp
+       return
+    end if
+    allocate(v(n, n), w(n))
+    v = a
+    lwork = max(64 * n, 1)
+    allocate(work(lwork))
+    call dsyev('N', 'U', n, v, n, w, work, lwork, info)
+    if (info .ne. 0) call neko_error('macro_coarsen: dsyev failed (min_eigenvalue)')
+    lam_min = minval(w)
+  end function min_eigenvalue
 
   ! ---- housekeeping ----
 

@@ -92,6 +92,7 @@ module amge_gs
      procedure, pass(this) :: init => amge_gs_init
      procedure, pass(this) :: op => amge_gs_op
      procedure, pass(this) :: free => amge_gs_free
+     procedure, pass(this) :: correct_shared_count => amge_gs_correct_shared_count
   end type amge_gs_t
 
   public :: amge_gs_map_shared_ids, amge_mesh_set_shared_from_dofmap
@@ -141,6 +142,62 @@ contains
     call this%map%free()
     call this%gs_h%free()
   end subroutine amge_gs_free
+
+  !> Correct a per-UNIQUE-vertex scalar (e.g. a locally-computed
+  !! duplication/membership count) to its TRUE cross-rank total, at
+  !! exactly the vertices this level's gs handle already knows are shared
+  !! (this%map%shared_gid) -- values at every other vertex are already
+  !! exact from local information alone and are left untouched.
+  !!
+  !! This is a DIFFERENT granularity than op()/apply(): op() sums a
+  !! per-DUPLICATED-SLOT field (one entry per (element, corner) copy),
+  !! which is the wrong thing to reach for here -- broadcasting a
+  !! per-vertex count out to every local duplicate slot and summing via
+  !! op() would multiply in the local slot count, not just add the
+  !! cross-rank contribution. Here w is already exactly one value per
+  !! unique vertex, so only the compact shared-block exchange (the same
+  !! nbsend/nbrecv/nbwait primitives apply() uses for its shared group) is
+  !! needed, with no local gather/scatter step at all.
+  !! @param elm_vtx_idx  the level's own CSR slot -> unique-vertex map
+  !!                      (used to translate this%map's slot-indexed
+  !!                      shared_dof_gs into the vertex-indexed w)
+  !! @param w  length = number of unique vertices on this level; corrected
+  !!           in place at shared vertices
+  subroutine amge_gs_correct_shared_count(this, elm_vtx_idx, w)
+    class(amge_gs_t), intent(inout) :: this
+    integer(i4), intent(in) :: elm_vtx_idx(:)
+    real(rp), intent(inout) :: w(:)
+    integer(i4), allocatable :: vert2blk(:)
+    real(rp), allocatable :: sbuf(:)
+    integer(i4) :: k, v, tid
+    type(c_ptr) :: deps, strm
+
+    if (this%map%nshared_blks .eq. 0) return
+
+    allocate(vert2blk(size(w)))
+    vert2blk = 0
+    do k = 1, this%map%nshared
+       v = elm_vtx_idx(this%map%shared_dof_gs(k))
+       vert2blk(v) = this%map%shared_gs_dof(k)
+    end do
+
+    allocate(sbuf(this%map%nshared_blks))
+    sbuf = 0.0_rp
+    do v = 1, size(w)
+       if (vert2blk(v) .gt. 0) sbuf(vert2blk(v)) = w(v)
+    end do
+
+    tid = 0
+    deps = C_NULL_PTR
+    strm = C_NULL_PTR
+    call this%gs_h%comm%nbsend(sbuf, this%map%nshared_blks, tid, deps, strm)
+    call this%gs_h%comm%nbrecv(tid)
+    call this%gs_h%comm%nbwait(sbuf, this%map%nshared_blks, GS_OP_ADD, strm)
+
+    do v = 1, size(w)
+       if (vert2blk(v) .gt. 0) w(v) = sbuf(vert2blk(v))
+    end do
+  end subroutine amge_gs_correct_shared_count
 
   !> Gather-scatter MAPPING for AMGe levels -- the analogue of Neko's
   !! gs_init_mapping, built from macro_mesh_t instead of dofmap_t.
