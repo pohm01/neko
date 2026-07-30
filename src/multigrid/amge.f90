@@ -21,7 +21,7 @@ module amge
 
   !> A hierarchy for AMGe
   type, public :: amge_hierarchy_t
-    integer :: nlvls = 3 !< number of levels in the hierarchy
+    integer :: nlvls = 2 !< number of levels in the hierarchy
     type(amge_level_t), allocatable :: lvl(:) !< amg levels in the hierarchy
     integer :: target_agg_size = 8 !< target agg size
     integer :: min_grid_vert = 8 !< soft min verts on coarse grid (stops coarsening once there are this many or fewer verts)
@@ -200,7 +200,7 @@ contains
     type(macro_topology_t) :: topo
     integer, allocatable :: part(:)
     integer :: l, nm
-    this%nlvls = 3
+    this%nlvls = 2
     allocate(this%lvl(0:this%nlvls-1))
 
     ! Create finest level
@@ -210,14 +210,21 @@ contains
          this%lvl(0)%elm_vtx_idx, coef%dof, &
          this%lvl(0)%mmsh%shared_vtx)
     call amge_fill_AM_from_ax(this%lvl(0), ax, coef, Xh, msh, blst)
-    call this%lvl(0)%data_init()
+    call this%lvl(0)%data_init(0)
 
     ! Build the rest of the hierarchy
     do l = 1, this%nlvls-1
        call agglomerate_level(this%lvl(l-1), this%target_agg_size, part, nm)
-       call coarsen_level_3d(this%lvl(l-1), part, nm, topo, this%lvl(l))
+       ! Ghost-extend the rank-boundary topology only for the first
+       ! coarsening step: amge_ghost.f90 is hardcoded to hex/8-vertex
+       ! elements (level 0's shape). Levels 1+ keep today's rank-local
+       ! limitation -- see amge_ghost.f90's header for why, and amge_gs.f90
+       ! for the invariant this restores (a shared coarse dof must be a
+       ! live, identically-classified unknown on every rank that shares it).
+       call coarsen_level_3d(this%lvl(l-1), part, nm, topo, this%lvl(l), &
+                             use_ghost=(l == 1))
        call check_invariants(topo)
-       call this%lvl(l)%data_init()
+       call this%lvl(l)%data_init(l)
        write(*, '("level ", I0, "->", I0, " dofs: ", I0, " -> ", I0)') (l-1), l, this%lvl(l)%tr%n_fine, this%lvl(l)%tr%n_coarse
        call check_transition(this%lvl(l-1), this%lvl(l))
        deallocate(part)
@@ -248,11 +255,17 @@ contains
     call macro_mesh_init_hex(lvl%mmsh, msh%nelv, hv)
 
     npts = msh%mpts
-    ! local vertex numbering for dof lists
-    allocate(g2l(npts))
     if (.not.(npts == lvl%mmsh%n_verts)) then
       print *, "VERT COUNTING ISSUE!"
     end if
+    ! g2l is indexed by GLOBAL vertex id, which ranges up to msh%glb_mpts
+    ! (the mesh-wide unique point count) -- NOT msh%mpts (this rank's own
+    ! local unique point count, "npts" above). Sizing to npts was an
+    ! out-of-bounds write on every rank whose elements reference global
+    ! ids beyond its own small local count, i.e. on any real MPI partition;
+    ! it only happened to be safe on a single rank, where glb_mpts == mpts.
+    allocate(g2l(msh%glb_mpts))
+    g2l = 0
     do v = 1, lvl%mmsh%n_verts
        g2l(lvl%mmsh%vert_id(v)) = v
     end do

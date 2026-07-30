@@ -45,7 +45,7 @@ module amge_level
 
   !> A numerical level of the AMGe hierarchy.
   type, public :: amge_level_t
-     integer :: idx                             !< level index in hierarchy
+     integer :: level                           !< level index in hierarchy
      type(macro_mesh_t) :: mmsh                 !< level mesh (entity tables)
      integer(i4), allocatable :: elm_vtx_ptr(:) !< CSR dof list per element
      integer(i4), allocatable :: elm_vtx_idx(:)
@@ -78,9 +78,11 @@ contains
   !! Needs mmsh to already be filled
   !! Needs elm_vtx_ptr elm_vtx_idx to already be filled
   !! Needs AM to already be filled
-  subroutine amge_level_data_init(this)
+  subroutine amge_level_data_init(this, level)
     class(amge_level_t), intent(inout) :: this
+    integer, intent(in) :: level
     logical, allocatable :: shared_vtx(:)
+    this%level = level
     if (this%topo_done) then
        ! Initialize gsh on level. shared_vtx is only seeded on level 0 once
        ! amge_mesh_set_shared_from_dofmap is wired into the hierarchy build;
