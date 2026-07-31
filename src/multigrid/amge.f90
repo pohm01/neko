@@ -1,7 +1,7 @@
 module amge
   use num_types, only : i4, rp, dp
   use comm
-  use mpi_f08, only: MPI_Allreduce, MPI_MIN, MPI_IN_PLACE, MPI_INTEGER
+  use mpi_f08, only: MPI_Allreduce, MPI_MIN, MPI_IN_PLACE, MPI_INTEGER, MPI_Barrier
   use utils, only : neko_error
   use math, only : copy, col2, rzero, add2s1
   use mesh, only : mesh_t
@@ -203,7 +203,7 @@ contains
     integer, intent(in) :: nlvls
     type(macro_topology_t) :: topo
     integer, allocatable :: part(:)
-    integer :: l, nm, glb_min_elm
+    integer :: l, nm, glb_min_elm, ierr
     this%nlvls = nlvls
     allocate(this%lvl(0:this%nlvls-1))
 
@@ -231,9 +231,11 @@ contains
                              use_ghost=.true.)
        call check_invariants(topo)
        call this%lvl(l)%data_init(l)
-       write(*, '("level ", I0, "->", I0, " elms: ", I0, " -> ", I0, " dofs: ", I0, " -> ", I0)') &
-         (l-1), l, this%lvl(l-1)%nelm(), this%lvl(l)%nelm(), &
+       write(*, '("   [check] rank ", I0, ": level ", I0, "->", I0, " elms: ", I0, " -> ", I0, &
+            & " dofs: ", I0, " -> ", I0)') &
+         pe_rank, (l-1), l, this%lvl(l-1)%nelm(), this%lvl(l)%nelm(), &
          this%lvl(l)%tr%n_fine, this%lvl(l)%tr%n_coarse
+       call MPI_Barrier(NEKO_COMM, ierr)
        if (this%lvl(l)%tr%n_coarse == 0) then
           call neko_error("AMGe: coarse grid has no dofs. This is known topology bug.")
        end if
@@ -272,6 +274,9 @@ contains
     end do
     call macro_mesh_init_hex(lvl%mmsh, msh%nelv, hv)
 
+    if (.not.(msh%mpts == lvl%mmsh%n_verts)) then
+      print *, "WARNING: vertex counts: neko msh", msh%mpts, "AMGe mmsh", lvl%mmsh%n_verts
+    end if
     allocate(g2l(msh%glb_mpts))
     g2l = 0
     do v = 1, lvl%mmsh%n_verts

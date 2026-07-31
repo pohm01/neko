@@ -11,7 +11,8 @@ module amge_utils
   use amge_topology, only : macro_topology_t
   use amge_level, only : amge_level_t, amge_vec_t, amge_level_transfer_t
   use comm, only : NEKO_COMM, pe_rank, MPI_REAL_PRECISION
-  use mpi_f08, only : MPI_Allreduce, MPI_SUM, MPI_MAX, MPI_IN_PLACE, MPI_INTEGER
+  use mpi_f08, only : MPI_Allreduce, MPI_SUM, MPI_MAX, MPI_IN_PLACE, MPI_INTEGER, &
+       MPI_Barrier
   implicit none
   private
 
@@ -266,6 +267,7 @@ contains
     real(rp), allocatable :: af(:,:), ac(:,:), p(:,:), pap(:,:)
     real(rp) :: gerr, cerr, rerr, serr
     integer(i4) :: m, a, q, fv, cv, glb_nf, glb_nc
+    integer :: ierr
     logical :: ok_a, ok_p
 
     ! glb_size is collective (MPI_Allreduce): every rank must call it, even
@@ -276,9 +278,13 @@ contains
     call assemble_dense_global(lvc, ac, ok_a)
     call build_p_dense_global(lvf, lvc, p, ok_p)
     if (.not. (ok_a .and. ok_p)) then
-       if (pe_rank .eq. 0) write(*, '("   [check] skipped: glb_size(fine) = ", I0, &
-            & "  glb_size(coarse) = ", I0, "  (cap = ", I0, ")")') &
-            glb_nf, glb_nc, MAX_GLB_DEBUG_SIZE
+       if (pe_rank .eq. 0) write(*, '("   [check] rank ", I0, ": skipped: glb_size(fine) = ", &
+            & I0, "  glb_size(coarse) = ", I0, "  (cap = ", I0, ")")') &
+            pe_rank, glb_nf, glb_nc, MAX_GLB_DEBUG_SIZE
+       ! ok_a/ok_p are already globally agreed (derived from all-reduced
+       ! glb_nf/glb_nc), so every rank takes this branch together -- safe
+       ! to call the barrier here unconditionally
+       call MPI_Barrier(NEKO_COMM, ierr)
        return
     end if
     call assemble_dense_global(lvf, af, ok_a)
@@ -306,9 +312,13 @@ contains
     rerr = maxval(abs(sum(ac, dim=2)))
     serr = maxval(abs(ac - transpose(ac)))
     if (pe_rank .eq. 0) then
-       write(*, '("   [check] ||P^T A P - A_c||_F = ", ES10.3, "  conformity = ", ES10.3, &
-            & "  rowsum = ", ES10.3, "  sym = ", ES10.3)') gerr, cerr, rerr, serr
+       write(*, '("   [check] rank ", I0, ": ||P^T A P - A_c||_F = ", ES10.3, &
+            & "  conformity = ", ES10.3, "  rowsum = ", ES10.3, "  sym = ", ES10.3)') &
+            pe_rank, gerr, cerr, rerr, serr
     end if
+    ! called by every rank unconditionally, not just rank 0, or the
+    ! barrier would deadlock
+    call MPI_Barrier(NEKO_COMM, ierr)
   end subroutine check_transition
 
   !> Invariants: every macroedge chain terminates at macrovertices (or is
@@ -317,6 +327,7 @@ contains
   subroutine check_invariants(topo)
     type(macro_topology_t), intent(in) :: topo
     integer(i4) :: k, a, b, v
+    integer :: ierr
     logical :: ok1, ok2, found
     ok1 = .true.
     do k = 1, topo%n_medge
@@ -336,8 +347,9 @@ contains
           end associate
        end do
     end do
-    write(*, '("   [check] chain endpoints are mv: ", L1, ' // &
-         '";  rim chains inside face verts: ", L1)') ok1, ok2
+    write(*, '("   [check] rank ", I0, ": chain endpoints are mv: ", L1, ' // &
+         '";  rim chains inside face verts: ", L1)') pe_rank, ok1, ok2
+    call MPI_Barrier(NEKO_COMM, ierr)
   end subroutine check_invariants
 
   !> SPSD check: eq.(3)/(6) of the AMGe theory note requires A^ell_M >= 0
@@ -348,12 +360,14 @@ contains
     type(amge_level_t), intent(in) :: lvl
     real(rp) :: worst
     integer(i4) :: e
+    integer :: ierr
     worst = huge(1.0_rp)
     do e = 1, lvl%nelm()
        worst = min(worst, min_eigenvalue(lvl%AM(e)%x))
     end do
-    write(*, '("   [check] SPSD: min eig over ", I0, " local matrices = ", ES10.3)') &
-         lvl%nelm(), worst
+    write(*, '("   [check] rank ", I0, ": SPSD: min eig over ", I0, &
+         & " local matrices = ", ES10.3)') pe_rank, lvl%nelm(), worst
+    call MPI_Barrier(NEKO_COMM, ierr)
   end subroutine check_spsd
 
   !> Constant reproduction: Pi~_M must map the all-ones coarse vector to
@@ -368,6 +382,7 @@ contains
     type(amge_level_t), intent(in) :: lvc
     real(rp) :: worst
     integer(i4) :: m, a
+    integer :: ierr
     worst = 0.0_rp
     do m = 1, lvc%tr%n_melm
        associate (mp => lvc%tr%maps(m))
@@ -376,7 +391,9 @@ contains
          end do
        end associate
     end do
-    write(*, '("   [check] constant reproduction: max |rowsum(Pi~) - 1| = ", ES10.3)') worst
+    write(*, '("   [check] rank ", I0, ": constant reproduction: max |rowsum(Pi~) - 1| = ", &
+         & ES10.3)') pe_rank, worst
+    call MPI_Barrier(NEKO_COMM, ierr)
   end subroutine check_constant_reproduction
 
   !> Smallest eigenvalue of a symmetric matrix (LAPACK dsyev). Local copy

@@ -21,7 +21,8 @@ module amge_coarsen
   use num_types, only : i4, rp
   use utils, only : neko_error
   use matrix, only : matrix_t
-  use comm, only : NEKO_COMM, pe_size
+  use comm, only : NEKO_COMM, pe_size, pe_rank
+  use mpi_f08, only : MPI_Barrier
   use amge_topology, only : macro_topology_t, &
        macro_topology_build_next_level_owned, macro_mesh_elem_face_csr, &
        macro_mesh_splice_ghost
@@ -70,7 +71,12 @@ contains
 
   !> Compact-growth agglomeration on the element dual graph (adjacency =
   !! shared facet): absorb the frontier element with the most
-  !! connections into the current cluster.
+  !! connections into the current cluster. A seed left with no
+  !! unassigned neighbor (boxed in entirely by earlier clusters) is
+  !! folded into its best-connected already-assigned neighboring
+  !! macroelement instead of becoming its own singleton macroelement;
+  !! only a genuinely isolated element (no facet neighbors at all) ends
+  !! up as a singleton.
   !! (Integration note: tree_amg's greedy aggregation plays this role.)
   subroutine agglomerate_level(lvl, target_size, part, n_macro)
     type(amge_level_t), intent(in) :: lvl
@@ -121,14 +127,14 @@ contains
     do i = 1, ne
        rand_order(i) = i
     end do
-    !! Shuffle rand_order using Fisher-Yates algorithm
-    !do i = ne, 2, -1
-    !   call random_number(r)
-    !   j = int(r * real(i, kind=rp)) + 1
-    !   tmp = rand_order(i)
-    !   rand_order(i) = rand_order(j)
-    !   rand_order(j) = tmp
-    !end do
+    ! Shuffle rand_order using Fisher-Yates algorithm
+    do i = ne, 2, -1
+       call random_number(r)
+       j = int(r * real(i, kind=rp)) + 1
+       tmp = rand_order(i)
+       rand_order(i) = rand_order(j)
+       rand_order(j) = tmp
+    end do
 
     ! ---- greedy compact-growth clustering over rand_order. part(e)==0
     ! means "unassigned"; scanning rand_order in order and skipping
@@ -142,12 +148,10 @@ contains
     do i = 1, ne
        s = rand_order(i)
        if (part(s) .ne. 0) cycle
-       ! seed a new cluster at s, then seed its frontier (unassigned
-       ! neighbors not already queued -- infr guards against queuing the
-       ! same candidate twice from two different absorbed members)
-       n_macro = n_macro + 1
-       part(s) = n_macro
-       cnt = 1
+       ! seed s's frontier (unassigned neighbors not already queued --
+       ! infr guards against queuing the same candidate twice from two
+       ! different absorbed members) before deciding whether to grow a
+       ! new cluster from it
        nfr = 0
        infr = .false.
        do q = adj_ptr(s) + 1, adj_ptr(s + 1)
@@ -156,6 +160,40 @@ contains
              nfr = nfr + 1; frontier(nfr) = e; infr(e) = .true.
           end if
        end do
+
+       if (nfr .eq. 0) then
+          ! s has no unassigned neighbor left to grow a new cluster into
+          ! -- every neighbor was already claimed by an earlier cluster.
+          ! Rather than leave s as its own singleton macroelement (a
+          ! degenerate coarse dof), fold it into whichever already-
+          ! assigned neighboring macroelement it shares the most facets
+          ! with. Only a genuinely isolated element (no facet neighbors
+          ! at all) falls through to become a singleton below.
+          block
+            integer(i4) :: best_id, best_cnt, qa, qb, deg
+            best_id = 0; best_cnt = 0
+            do qa = adj_ptr(s) + 1, adj_ptr(s + 1)
+               if (part(adj_idx(qa)) .eq. 0) cycle
+               deg = 0
+               do qb = adj_ptr(s) + 1, adj_ptr(s + 1)
+                  if (part(adj_idx(qb)) .eq. part(adj_idx(qa))) deg = deg + 1
+               end do
+               if (deg .gt. best_cnt) then
+                  best_cnt = deg; best_id = part(adj_idx(qa))
+               end if
+            end do
+            if (best_id .gt. 0) then
+               part(s) = best_id
+               sizes(best_id) = sizes(best_id) + 1
+               cycle
+            end if
+          end block
+       end if
+
+       ! seed a new cluster at s (frontier already built above)
+       n_macro = n_macro + 1
+       part(s) = n_macro
+       cnt = 1
        ! grow the cluster one element at a time until it reaches
        ! target_size or the frontier runs dry (a small pocket of
        ! elements with nowhere further to grow). Each round scores every
@@ -227,6 +265,7 @@ contains
     real(rp), allocatable :: w(:)
     integer(i4) :: m, e, k, a, q, v, nd, nb, nc, nmv
     integer(i4), allocatable :: dsizes(:)   !< debug: coarse dofs per macroelement
+    integer :: ierr   !< debug: MPI_Barrier status after [check] prints
     logical :: ghosted
     type(schur_check_t) :: schk
     type(amge_ghost_t) :: gh
@@ -461,11 +500,15 @@ contains
     end associate
     if (ghosted) call gh%free()
     if (AMGE_DEBUG_CHECKS .and. schk%n_checked .gt. 0) then
-       write(*, '("   [check] per-macroelement (n=", I0, "): S sym = ", ES10.3, &
+       write(*, '("   [check] rank ", I0, ": per-macroelement (n=", I0, "): S sym = ", ES10.3, &
             & "  harmonic resid = ", ES10.3, "  |PiT^TAPi - Ac| = ", ES10.3, &
-            & "  min eig(Ac) = ", ES10.3)') schk%n_checked, schk%sym_err, &
+            & "  min eig(Ac) = ", ES10.3)') pe_rank, schk%n_checked, schk%sym_err, &
             schk%harmonic_err, schk%galerkin_err, schk%min_eig
     end if
+    ! gated on AMGE_DEBUG_CHECKS alone (uniform across ranks), NOT on
+    ! schk%n_checked (which can vary per rank) -- every rank must reach
+    ! this call or the barrier deadlocks
+    if (AMGE_DEBUG_CHECKS) call MPI_Barrier(NEKO_COMM, ierr)
   end subroutine coarsen_level_3d
 
   !> Extract, for every local element, its own vertex/face/edge CSR
@@ -565,6 +608,7 @@ contains
     type(ivec_t) :: touching, dofs
     real(rp), allocatable :: a(:,:), sm(:,:), piv(:,:)
     integer(i4) :: k, nch, nb, nf, i
+    integer :: ierr
     logical :: closed
     real(rp) :: sym_err, min_eig
 
@@ -625,9 +669,12 @@ contains
        end associate
     end do
     if (AMGE_DEBUG_CHECKS .and. topo%n_medge .gt. 0) then
-       write(*, '("   [check] Q_E (n=", I0, "): S_E sym = ", ES10.3, &
-            & "  min eig(S_E) = ", ES10.3)') topo%n_medge, sym_err, min_eig
+       write(*, '("   [check] rank ", I0, ": Q_E (n=", I0, "): S_E sym = ", ES10.3, &
+            & "  min eig(S_E) = ", ES10.3)') pe_rank, topo%n_medge, sym_err, min_eig
     end if
+    ! gated on AMGE_DEBUG_CHECKS alone (uniform across ranks), NOT on
+    ! topo%n_medge (which can vary per rank)
+    if (AMGE_DEBUG_CHECKS) call MPI_Barrier(NEKO_COMM, ierr)
   end subroutine compute_edge_maps
 
   !> One Q_F per macroface, with a globally fixed sorted split of the
@@ -645,6 +692,7 @@ contains
     type(ivec_t) :: touching, dofs
     real(rp), allocatable :: a(:,:), sm(:,:), piv(:,:)
     integer(i4) :: k, nb, ni, i
+    integer :: ierr
     real(rp) :: sym_err, min_eig
     integer(i4) :: n_checked
 
@@ -697,9 +745,12 @@ contains
        end associate
     end do
     if (AMGE_DEBUG_CHECKS .and. n_checked .gt. 0) then
-       write(*, '("   [check] Q_F (n=", I0, "): S_F sym = ", ES10.3, &
-            & "  min eig(S_F) = ", ES10.3)') n_checked, sym_err, min_eig
+       write(*, '("   [check] rank ", I0, ": Q_F (n=", I0, "): S_F sym = ", ES10.3, &
+            & "  min eig(S_F) = ", ES10.3)') pe_rank, n_checked, sym_err, min_eig
     end if
+    ! gated on AMGE_DEBUG_CHECKS alone (uniform across ranks), NOT on
+    ! n_checked (which can vary per rank)
+    if (AMGE_DEBUG_CHECKS) call MPI_Barrier(NEKO_COMM, ierr)
   end subroutine compute_face_maps
 
   !> Sorted boundary/interior vertex split of macroface k: boundary =
@@ -1220,13 +1271,16 @@ contains
 
   !> Debug helper: print min/avg/median/max of an integer size array
   !! (aggregate sizes, coarse dofs per macroelement, ...) in one common
-  !! format, gated by the caller on AMGE_DEBUG_CHECKS.
+  !! format, gated by the caller on AMGE_DEBUG_CHECKS. Both call sites
+  !! gate on that same (rank-uniform) flag alone, so it's safe to place
+  !! the debug MPI_Barrier here rather than at each call site.
   subroutine report_size_stats(label, sizes)
     character(len=*), intent(in) :: label
     integer(i4), intent(in) :: sizes(:)
     integer(i4), allocatable :: sorted(:)
     real(rp) :: avg, med
     integer(i4) :: n
+    integer :: ierr
     n = size(sizes)
     sorted = sizes
     call sort_i4(sorted)
@@ -1236,8 +1290,9 @@ contains
     else
        med = 0.5_rp * real(sorted(n / 2) + sorted(n / 2 + 1), rp)
     end if
-    write(*, '("   [check] ", A, " (n=", I0, "): min/avg/median/max = ", &
-         & I0, "/", F6.2, "/", F6.2, "/", I0)') label, n, sorted(1), avg, med, sorted(n)
+    write(*, '("   [check] rank ", I0, ": ", A, " (n=", I0, "): min/avg/median/max = ", &
+         & I0, "/", F6.2, "/", F6.2, "/", I0)') pe_rank, label, n, sorted(1), avg, med, sorted(n)
+    call MPI_Barrier(NEKO_COMM, ierr)
   end subroutine report_size_stats
 
 end module amge_coarsen
