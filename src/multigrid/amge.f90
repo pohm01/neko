@@ -234,6 +234,9 @@ contains
        write(*, '("level ", I0, "->", I0, " elms: ", I0, " -> ", I0, " dofs: ", I0, " -> ", I0)') &
          (l-1), l, this%lvl(l-1)%nelm(), this%lvl(l)%nelm(), &
          this%lvl(l)%tr%n_fine, this%lvl(l)%tr%n_coarse
+       if (this%lvl(l)%tr%n_coarse == 0) then
+          call neko_error("AMGe: coarse grid has no dofs. This is known topology bug.")
+       end if
        call check_transition(this%lvl(l-1), this%lvl(l))
        call check_spsd(this%lvl(l))
        call check_constant_reproduction(this%lvl(l))

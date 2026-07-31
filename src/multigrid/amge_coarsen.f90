@@ -87,6 +87,13 @@ contains
     ne = lvl%mmsh%n_elem
     if (allocated(part)) deallocate(part)
     allocate(part(ne))
+
+    ! ---- element dual graph: e1 -- e2 iff they share an interior facet
+    ! (face_nel==2). Two-pass CSR build: first pass counts each element's
+    ! degree into adj_ptr and prefix-sums it into offsets, second pass
+    ! (using fill(:) as a per-element running write cursor) scatters the
+    ! actual neighbor ids into adj_idx at those offsets. A facet with
+    ! face_nel==1 is a mesh/rank boundary and contributes no edge.
     allocate(adj_ptr(ne + 1))
     adj_ptr = 0
     do f = 1, lvl%mmsh%n_face
@@ -122,12 +129,20 @@ contains
     !   rand_order(j) = tmp
     !end do
 
+    ! ---- greedy compact-growth clustering over rand_order. part(e)==0
+    ! means "unassigned"; scanning rand_order in order and skipping
+    ! already-assigned elements means every element becomes either a new
+    ! cluster's seed or gets absorbed into one, so every element ends up
+    ! in exactly one macroelement (part fully covers 1..n_macro).
     part = 0
     n_macro = 0
     allocate(frontier(ne), infr(ne))
     do i = 1, ne
        s = rand_order(i)
        if (part(s) .ne. 0) cycle
+       ! seed a new cluster at s, then seed its frontier (unassigned
+       ! neighbors not already queued -- infr guards against queuing the
+       ! same candidate twice from two different absorbed members)
        n_macro = n_macro + 1
        part(s) = n_macro
        cnt = 1
@@ -139,6 +154,13 @@ contains
              nfr = nfr + 1; frontier(nfr) = e; infr(e) = .true.
           end if
        end do
+       ! grow the cluster one element at a time until it reaches
+       ! target_size or the frontier runs dry (a small pocket of
+       ! elements with nowhere further to grow). Each round scores every
+       ! frontier candidate by how many of ITS neighbors are already in
+       ! the current cluster (sc), and absorbs the best-connected one
+       ! (best/bscore) -- this is what keeps clusters compact/blob-shaped
+       ! rather than growing thin tendrils.
        do while (cnt .lt. target_size .and. nfr .gt. 0)
           best = 0; bscore = -1
           do a = 1, nfr
@@ -153,6 +175,9 @@ contains
              end if
           end do
           if (best .eq. 0) exit
+          ! absorb the winner (swap-with-last removal from the frontier,
+          ! order doesn't matter here) and extend the frontier with its
+          ! own unassigned, not-yet-queued neighbors
           c = frontier(best)
           frontier(best) = frontier(nfr); nfr = nfr - 1
           part(c) = n_macro
