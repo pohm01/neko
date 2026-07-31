@@ -22,10 +22,11 @@ module amge_coarsen
   use utils, only : neko_error
   use matrix, only : matrix_t
   use comm, only : NEKO_COMM, pe_size
-  use amge_topology, only : macro_topology_t, macro_mesh_t, macro_mesh_init_hex, &
-       macro_topology_build_next_level_owned
+  use amge_topology, only : macro_topology_t, &
+       macro_topology_build_next_level_owned, macro_mesh_elem_face_csr, &
+       macro_mesh_splice_ghost
   use amge_level, only : amge_level_t
-  use amge_ghost, only : amge_ghost_t, amge_ghost_exchange, amge_ghost_extended_list
+  use amge_ghost, only : amge_ghost_t, amge_ghost_exchange, amge_ghost_part_ext
   implicit none
   private
 
@@ -181,7 +182,7 @@ contains
     type(macro_topology_t), intent(inout) :: topo
     type(amge_level_t), intent(inout) :: lvlC
     !> Ghost-extend the rank-boundary topology/trace-map extraction for this
-    !! step (level 0 -> 1 only; see amge_ghost.f90). Ignored (treated as
+    !! step (every level; see amge_ghost.f90). Ignored (treated as
     !! .false.) whenever pe_size == 1, so a single-rank run is unaffected.
     logical, optional, intent(in) :: use_ghost
 
@@ -198,8 +199,15 @@ contains
     type(schur_check_t) :: schk
     type(amge_ghost_t) :: gh
     type(amge_level_t) :: lvl_ext
-    integer(i4), allocatable :: hv_local(:,:), hv_ext(:,:), part_ext(:)
-    real(rp), allocatable :: amat_local(:,:), amat_ext(:,:)
+    integer(i4), allocatable :: part_ext(:)
+    integer(i4), allocatable :: p_vtx_ptr(:), p_vtx_idx(:)
+    integer(i4), allocatable :: p_face_ptr(:), p_fv_ptr(:), p_fv_idx(:)
+    integer(i4), allocatable :: p_fe_ptr(:)
+    integer(i4), allocatable :: p_fe_vtx(:,:)
+    integer(i4), allocatable :: p_amat_ptr(:)
+    real(rp), allocatable :: p_amat(:)
+    integer(i4), allocatable :: g2l_ext(:)
+    integer(i4) :: n_ext, ge, nv_e
     integer(i4) :: moff, n_macro_topo
 
     ghosted = .false.
@@ -210,14 +218,57 @@ contains
        ! one vertex-layer ghost exchange so this rank's topology/trace-map
        ! extraction sees a complete neighborhood at every rank-boundary
        ! entity -- see amge_ghost.f90 for the rationale.
-       call build_hv_amat_local(lvl, hv_local, amat_local)
-       call amge_ghost_exchange(NEKO_COMM%mpi_val, hv_local, amat_local, &
-                                part, n_macro, gh)
-       call amge_ghost_extended_list(gh, hv_local, amat_local, part, &
-                                     hv_ext, amat_ext, part_ext)
-       call build_ghost_ext_level(hv_ext, amat_ext, lvl%mmsh%shared_vtx, lvl_ext)
+       call build_ghost_payload_local(lvl, p_vtx_ptr, p_vtx_idx, &
+            p_face_ptr, p_fv_ptr, p_fv_idx, p_fe_ptr, p_fe_vtx, &
+            p_amat_ptr, p_amat)
+       call amge_ghost_exchange(NEKO_COMM%mpi_val, p_vtx_ptr, p_vtx_idx, &
+            p_face_ptr, p_fv_ptr, p_fv_idx, p_fe_ptr, p_fe_vtx, &
+            p_amat_ptr, p_amat, part, n_macro, gh)
+       call amge_ghost_part_ext(gh, part, part_ext)
        moff = gh%macro_offset
        n_macro_topo = gh%n_macro_global
+
+       ! splice the ghost elements' own face/edge/vertex sub-tables (just
+       ! received) onto a copy of this level's own mesh -- NOT a rebuild
+       ! from a raw vertex list, which only works at level 0 (see
+       ! amge_ghost.f90's header and macro_mesh_splice_ghost's doc comment)
+       call macro_mesh_splice_ghost(lvl%mmsh, gh%n_ghost, gh%vtx_ptr, &
+            gh%vtx_idx, gh%face_ptr, gh%face_vtx_ptr, gh%face_vtx_idx, &
+            gh%face_edge_ptr, gh%face_edge_vtx, lvl_ext%mmsh)
+
+       ! lvl_ext's elm_vtx_ptr/idx + AM: local elements keep their own
+       ! (unchanged local numbering, since macro_mesh_splice_ghost leaves
+       ! vertices 1..lvl%mmsh%n_verts untouched); ghost elements are
+       ! appended after them, their vertex ids translated through a fresh
+       ! global -> extended-local map built off lvl_ext%mmsh%vert_id.
+       n_ext = lvl%mmsh%n_elem + gh%n_ghost
+       allocate(lvl_ext%elm_vtx_ptr(n_ext + 1), lvl_ext%AM(n_ext))
+       lvl_ext%elm_vtx_ptr(1:lvl%mmsh%n_elem + 1) = lvl%elm_vtx_ptr
+       allocate(lvl_ext%elm_vtx_idx(lvl%elm_vtx_ptr(lvl%mmsh%n_elem + 1) + &
+            gh%vtx_ptr(gh%n_ghost + 1)))
+       lvl_ext%elm_vtx_idx(1:lvl%elm_vtx_ptr(lvl%mmsh%n_elem + 1)) = lvl%elm_vtx_idx
+       do e = 1, lvl%mmsh%n_elem
+          call lvl_ext%AM(e)%init(lvl%ndof_el(e), lvl%ndof_el(e))
+          lvl_ext%AM(e)%x = lvl%AM(e)%x
+       end do
+       allocate(g2l_ext(maxval(lvl_ext%mmsh%vert_id)))
+       g2l_ext = 0
+       do v = 1, lvl_ext%mmsh%n_verts
+          g2l_ext(lvl_ext%mmsh%vert_id(v)) = v
+       end do
+       do ge = 1, gh%n_ghost
+          e = lvl%mmsh%n_elem + ge
+          nv_e = gh%vtx_ptr(ge + 1) - gh%vtx_ptr(ge)
+          lvl_ext%elm_vtx_ptr(e + 1) = lvl_ext%elm_vtx_ptr(e) + nv_e
+          do k = 1, nv_e
+             lvl_ext%elm_vtx_idx(lvl_ext%elm_vtx_ptr(e) + k) = &
+                  g2l_ext(gh%vtx_idx(gh%vtx_ptr(ge) + k))
+          end do
+          call lvl_ext%AM(e)%init(nv_e, nv_e)
+          lvl_ext%AM(e)%x = reshape( &
+               gh%amat(gh%amat_ptr(ge) + 1 : gh%amat_ptr(ge + 1)), [nv_e, nv_e])
+       end do
+
        call topo%init_tables(lvl_ext%mmsh, part_ext, n_macro_topo)
        call compute_edge_maps(lvl_ext, topo, qe)
        call compute_face_maps(lvl_ext, topo, fb, fi, qf)
@@ -382,73 +433,87 @@ contains
     end if
   end subroutine coarsen_level_3d
 
-  !> Reconstruct this level's global vertex ids (hex_t corner order) and
-  !! flat 8x8 element matrices from its own already-built CSR/AM data --
-  !! exactly what amge_ghost_exchange needs to send to neighboring ranks.
-  !! No new storage on amge_level_t: everything needed is already there.
-  subroutine build_hv_amat_local(lvl, hv, amat)
+  !> Extract, for every local element, its own vertex/face/edge CSR
+  !! sub-tables from lvl%mmsh (already built, at any level) plus its
+  !! dense matrix -- the payload amge_ghost_exchange ships to
+  !! neighboring ranks. Unlike the old hex-only build_hv_amat_local, this
+  !! makes no arity assumption: it reuses whatever facet/edge structure
+  !! lvl%mmsh already has (built by macro_mesh_init_hex at level 0, or
+  !! build_next_level[_owned] at level >= 1) rather than re-deriving it
+  !! from a fixed template -- which is impossible above level 0 anyway,
+  !! see amge_ghost.f90's header. A face shared by two local elements is
+  !! reported once per element (harmless duplication: the receiver dedups
+  !! purely by vertex-set identity, see macro_mesh_splice_ghost).
+  subroutine build_ghost_payload_local(lvl, vtx_ptr, vtx_idx, &
+       face_ptr, face_vtx_ptr, face_vtx_idx, face_edge_ptr, face_edge_vtx, &
+       amat_ptr, amat)
     type(amge_level_t), intent(in) :: lvl
-    integer(i4), allocatable, intent(out) :: hv(:,:)
-    real(rp), allocatable, intent(out) :: amat(:,:)
-    integer(i4) :: e, k, off, nelv
+    integer(i4), allocatable, intent(out) :: vtx_ptr(:), vtx_idx(:)
+    integer(i4), allocatable, intent(out) :: face_ptr(:), face_vtx_ptr(:)
+    integer(i4), allocatable, intent(out) :: face_vtx_idx(:)
+    integer(i4), allocatable, intent(out) :: face_edge_ptr(:)
+    integer(i4), allocatable, intent(out) :: face_edge_vtx(:,:)
+    integer(i4), allocatable, intent(out) :: amat_ptr(:)
+    real(rp), allocatable, intent(out) :: amat(:)
+    integer(i4), allocatable :: eface_ptr(:), eface_idx(:)
+    integer(i4) :: nelv, e, k, off, a, f, g, nv_e, slot
 
     nelv = lvl%mmsh%n_elem
-    allocate(hv(8, nelv), amat(64, nelv))
+    call macro_mesh_elem_face_csr(lvl%mmsh, eface_ptr, eface_idx)
+
+    allocate(vtx_ptr(nelv + 1), face_ptr(nelv + 1), amat_ptr(nelv + 1))
+    vtx_ptr(1) = 0; face_ptr(1) = 0; amat_ptr(1) = 0
+    do e = 1, nelv
+       nv_e = lvl%ndof_el(e)
+       vtx_ptr(e + 1) = vtx_ptr(e) + nv_e
+       amat_ptr(e + 1) = amat_ptr(e) + nv_e * nv_e
+       face_ptr(e + 1) = face_ptr(e) + (eface_ptr(e + 1) - eface_ptr(e))
+    end do
+    allocate(vtx_idx(vtx_ptr(nelv + 1)), amat(amat_ptr(nelv + 1)))
+
+    allocate(face_vtx_ptr(face_ptr(nelv + 1) + 1))
+    allocate(face_edge_ptr(face_ptr(nelv + 1) + 1))
+    face_vtx_ptr(1) = 0
+    face_edge_ptr(1) = 0
+    slot = 0
+    do e = 1, nelv
+       do a = eface_ptr(e) + 1, eface_ptr(e + 1)
+          f = eface_idx(a)
+          slot = slot + 1
+          face_vtx_ptr(slot + 1) = face_vtx_ptr(slot) + &
+               (lvl%mmsh%face_vtx_ptr(f + 1) - lvl%mmsh%face_vtx_ptr(f))
+          face_edge_ptr(slot + 1) = face_edge_ptr(slot) + &
+               (lvl%mmsh%face_edge_ptr(f + 1) - lvl%mmsh%face_edge_ptr(f))
+       end do
+    end do
+    allocate(face_vtx_idx(face_vtx_ptr(face_ptr(nelv + 1) + 1)))
+    allocate(face_edge_vtx(2, face_edge_ptr(face_ptr(nelv + 1) + 1)))
+
+    slot = 0
     do e = 1, nelv
        off = lvl%elm_vtx_ptr(e)
-       do k = 1, 8
-          hv(k, e) = lvl%mmsh%vert_id(lvl%elm_vtx_idx(off + k))
+       do k = 1, lvl%ndof_el(e)
+          vtx_idx(vtx_ptr(e) + k) = lvl%mmsh%vert_id(lvl%elm_vtx_idx(off + k))
        end do
-       amat(:, e) = reshape(lvl%AM(e)%x, [64])
-    end do
-  end subroutine build_hv_amat_local
-
-  !> Build a throwaway amge_level_t around a ghost-extended hex element
-  !! list (this rank's local elements, listed first in the SAME order used
-  !! to build lvl%mmsh, followed by ghost elements from neighboring ranks).
-  !! Used only to feed compute_edge_maps/compute_face_maps/init_tables a
-  !! complete neighborhood at a rank boundary -- never touches the
-  !! caller's own (unextended) level.
-  subroutine build_ghost_ext_level(hv_ext, amat_ext, shared_vtx_local, lvl_ext)
-    integer(i4), intent(in) :: hv_ext(:,:)
-    real(rp), intent(in) :: amat_ext(:,:)
-    logical, intent(in) :: shared_vtx_local(:)
-    type(amge_level_t), intent(inout) :: lvl_ext
-    integer(i4), allocatable :: g2l(:)
-    integer(i4) :: n_ext, e, k, off, v
-
-    n_ext = size(hv_ext, 2)
-    call macro_mesh_init_hex(lvl_ext%mmsh, n_ext, hv_ext)
-
-    ! shared_vtx isn't set by macro_mesh_init_hex; copy this rank's own
-    ! (dofmap-seeded) flag for local vertices, default .false. for
-    ! ghost-only vertices beyond them (fact: local vertices keep identical
-    ! numbering 1..size(shared_vtx_local), see build_ghost_ext_level's
-    ! caller comment on ordering).
-    allocate(lvl_ext%mmsh%shared_vtx(lvl_ext%mmsh%n_verts))
-    lvl_ext%mmsh%shared_vtx = .false.
-    lvl_ext%mmsh%shared_vtx(1:size(shared_vtx_local)) = shared_vtx_local
-
-    allocate(g2l(maxval(hv_ext)))
-    g2l = 0
-    do v = 1, lvl_ext%mmsh%n_verts
-       g2l(lvl_ext%mmsh%vert_id(v)) = v
-    end do
-
-    allocate(lvl_ext%elm_vtx_ptr(n_ext + 1))
-    allocate(lvl_ext%elm_vtx_idx(8 * n_ext))
-    allocate(lvl_ext%AM(n_ext))
-    lvl_ext%elm_vtx_ptr(1) = 0
-    do e = 1, n_ext
-       lvl_ext%elm_vtx_ptr(e + 1) = lvl_ext%elm_vtx_ptr(e) + 8
-       off = lvl_ext%elm_vtx_ptr(e)
-       do k = 1, 8
-          lvl_ext%elm_vtx_idx(off + k) = g2l(hv_ext(k, e))
+       amat(amat_ptr(e) + 1 : amat_ptr(e + 1)) = &
+            reshape(lvl%AM(e)%x, [lvl%ndof_el(e)**2])
+       do a = eface_ptr(e) + 1, eface_ptr(e + 1)
+          f = eface_idx(a)
+          slot = slot + 1
+          do k = 1, lvl%mmsh%face_vtx_ptr(f + 1) - lvl%mmsh%face_vtx_ptr(f)
+             face_vtx_idx(face_vtx_ptr(slot) + k) = lvl%mmsh%vert_id( &
+                  lvl%mmsh%face_vtx_idx(lvl%mmsh%face_vtx_ptr(f) + k))
+          end do
+          do k = 1, lvl%mmsh%face_edge_ptr(f + 1) - lvl%mmsh%face_edge_ptr(f)
+             g = lvl%mmsh%face_edge_idx(lvl%mmsh%face_edge_ptr(f) + k)
+             face_edge_vtx(1, face_edge_ptr(slot) + k) = &
+                  lvl%mmsh%vert_id(lvl%mmsh%edge_vtx(1, g))
+             face_edge_vtx(2, face_edge_ptr(slot) + k) = &
+                  lvl%mmsh%vert_id(lvl%mmsh%edge_vtx(2, g))
+          end do
        end do
-       call lvl_ext%AM(e)%init(8, 8)
-       lvl_ext%AM(e)%x = reshape(amat_ext(:, e), [8, 8])
     end do
-  end subroutine build_ghost_ext_level
+  end subroutine build_ghost_payload_local
 
   ! ================== trace maps ==================
 

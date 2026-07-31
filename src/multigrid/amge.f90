@@ -1,5 +1,7 @@
 module amge
   use num_types, only : i4, rp, dp
+  use comm
+  use mpi_f08, only: MPI_Allreduce, MPI_MIN, MPI_IN_PLACE, MPI_INTEGER
   use utils, only : neko_error
   use math, only : copy, col2, rzero, add2s1
   use mesh, only : mesh_t
@@ -25,7 +27,7 @@ module amge
     integer :: nlvls = 2 !< number of levels in the hierarchy
     type(amge_level_t), allocatable :: lvl(:) !< amg levels in the hierarchy
     integer :: target_agg_size = 8 !< target agg size
-    integer :: min_grid_vert = 8 !< soft min verts on coarse grid (stops coarsening once there are this many or fewer verts)
+    integer :: min_grid_elm = 1 !< minimum elements on coarse grid
   contains
     procedure, pass(this) :: init => amge_hierarchy_init
     procedure, pass(this) :: vcycle => amge_flat_vcycle
@@ -201,7 +203,7 @@ contains
     integer, intent(in) :: nlvls
     type(macro_topology_t) :: topo
     integer, allocatable :: part(:)
-    integer :: l, nm
+    integer :: l, nm, glb_min_elm
     this%nlvls = nlvls
     allocate(this%lvl(0:this%nlvls-1))
 
@@ -218,22 +220,29 @@ contains
     ! Build the rest of the hierarchy
     do l = 1, this%nlvls-1
        call agglomerate_level(this%lvl(l-1), this%target_agg_size, part, nm)
-       ! Ghost-extend the rank-boundary topology only for the first
-       ! coarsening step: amge_ghost.f90 is hardcoded to hex/8-vertex
-       ! elements (level 0's shape). Levels 1+ keep today's rank-local
-       ! limitation -- see amge_ghost.f90's header for why, and amge_gs.f90
-       ! for the invariant this restores (a shared coarse dof must be a
-       ! live, identically-classified unknown on every rank that shares it).
+       ! Ghost-extend the rank-boundary topology at every coarsening step
+       ! (amge_ghost.f90's CSR wire format and macro_mesh_splice_ghost are
+       ! arity-generic, not tied to level 0's hex shape) -- see
+       ! amge_ghost.f90's header for why a halo is needed at all, and
+       ! amge_gs.f90 for the invariant this restores (a shared coarse dof
+       ! must be a live, identically-classified unknown on every rank that
+       ! shares it). coarsen_level_3d ignores this on single-rank runs.
        call coarsen_level_3d(this%lvl(l-1), part, nm, topo, this%lvl(l), &
-                             use_ghost=(l == 1))
+                             use_ghost=.true.)
        call check_invariants(topo)
        call this%lvl(l)%data_init(l)
-       write(*, '("level ", I0, "->", I0, " dofs: ", I0, " -> ", I0)') (l-1), l, this%lvl(l)%tr%n_fine, this%lvl(l)%tr%n_coarse
+       write(*, '("level ", I0, "->", I0, " elms: ", I0, " -> ", I0, " dofs: ", I0, " -> ", I0)') &
+         (l-1), l, this%lvl(l-1)%nelm(), this%lvl(l)%nelm(), &
+         this%lvl(l)%tr%n_fine, this%lvl(l)%tr%n_coarse
        call check_transition(this%lvl(l-1), this%lvl(l))
        call check_spsd(this%lvl(l))
        call check_constant_reproduction(this%lvl(l))
        deallocate(part)
-       if (this%lvl(l)%mmsh%n_verts <= this%min_grid_vert) exit
+       ! Check if further coarsening is possible/wanted
+       glb_min_elm = this%lvl(l)%mmsh%n_elem
+       call MPI_Allreduce(MPI_IN_PLACE, glb_min_elm, 1, &
+            MPI_INTEGER, MPI_MIN, NEKO_COMM)
+       if (glb_min_elm <= this%min_grid_elm) exit
     end do
     if (l < this%nlvls-1) then
        this%nlvls = l+1

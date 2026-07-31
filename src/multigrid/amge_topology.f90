@@ -42,12 +42,19 @@
 !!  * The local face/edge numbering of the reference hex matches the
 !!    Octave prototype, NOT Neko's hex_t facet convention; remap when
 !!    integrating.
-!!  * Serial / rank-local: agglomerates are assumed not to cross rank
-!!    boundaries. A facet with a single local element gets label
-!!    (part,0), which conflates the physical boundary with rank
-!!    interfaces; production code should consult msh%facet_neigh (and
-!!    the distributed data in mesh_t) to distinguish them and to
-!!    exchange skeleton flags across ranks.
+!!  * Agglomerates are assumed not to cross rank boundaries: a facet
+!!    with a single local element gets label (part,0), which conflates
+!!    the physical boundary with rank interfaces. This module resolves
+!!    that ambiguity from the OUTSIDE, not by consulting rank info
+!!    itself: the caller (see amge_ghost.f90 and
+!!    build_ghost_payload_local/macro_mesh_splice_ghost in
+!!    amge_coarsen.f90) extends mmsh with a one-vertex-layer halo of
+!!    neighboring ranks' elements before calling init_tables, so a facet
+!!    that turns out to have a real neighbor gets face_nel==2 like any
+!!    other interior facet -- at every level, not just the finest, since
+!!    a ghost element's own face/edge sub-tables (inherited, not
+!!    re-derivable from a template above level 0) are shipped over and
+!!    grafted on rather than recomputed.
 !!  * Natural home: alongside the tree_amg coarse-grid infrastructure,
 !!    complementing its aggregation with interface-aware macroentity
 !!    structure for trace-compatible interpolation.
@@ -74,7 +81,8 @@ module amge_topology
   use utils, only : neko_error
   implicit none
   private
-  public :: macro_mesh_init_hex, macro_topology_build_next_level_owned
+  public :: macro_mesh_init_hex, macro_topology_build_next_level_owned, &
+       macro_mesh_elem_face_csr, macro_mesh_splice_ghost
 
   !> A macroedge: an open or closed chain of vertices (local indices);
   !! chain(1) == chain(size(chain)) marks a closed loop (breakpoint at
@@ -147,6 +155,29 @@ module amge_topology
      integer(i4) :: cap = 0
      integer(i4) :: n = 0
   end type tuple_map_t
+
+  !> One slot of a vset_map_t: a sorted, variable-length vertex-id key.
+  !! Unallocated %v marks an empty slot.
+  type :: vset_key_t
+     integer(i4), allocatable :: v(:)
+  end type vset_key_t
+
+  !> Sorted-vertex-set -> value map. Unlike tuple_map_t (capped at 4 keys,
+  !! enough for a hex's quad facets), a macroface above level 0 can have
+  !! arbitrarily many vertices (a coplanar run of many fine facets), so
+  !! this variant stores variable-length keys and compares them in full
+  !! on collision. Used only by macro_mesh_splice_ghost to identify a
+  !! ghost element's face against the local mesh's own faces (or another
+  !! ghost element's face already spliced in this same pass) purely by
+  !! vertex-set identity -- the only identity a macroface has above level
+  !! 0, since its facet/edge structure is inherited, not derivable from
+  !! its vertex set via any fixed template.
+  type :: vset_map_t
+     type(vset_key_t), allocatable :: keys(:)
+     integer(i4), allocatable :: val(:)
+     integer(i4) :: cap = 0
+     integer(i4) :: n = 0
+  end type vset_map_t
 
   ! Reference-hex local facets and edges, in NEKO hex_t vertex ordering
   ! (src/mesh/hex.f90). Vertices are numbered lexicographically within
@@ -696,8 +727,9 @@ contains
     end do
   end subroutine macro_topology_build_next_level
 
-  !> Ownership-restricted variant of build_next_level, for the one
-  !! ghost-extended coarsening step (level 0 -> 1, ranks > 1). @a this was
+  !> Ownership-restricted variant of build_next_level, for a
+  !! ghost-extended coarsening step (every level, ranks > 1; see
+  !! macro_mesh_splice_ghost). @a this was
   !! built from an EXTENDED element list (this rank's local elements plus a
   !! one vertex-layer ghost halo of neighbors' elements), so its labels are
   !! GLOBAL macro ids and its vertex numbering has local vertices FIRST
@@ -720,10 +752,10 @@ contains
   !!    so an index-only filter would wrongly keep that ghost-to-ghost facet
   !!    and inject a foreign macro id into mmshC%face_el.
   !! A kept face with only one label owned emits face_nel==1 with only the
-  !! owned side stored (in LOCAL numbering, label - owned_lo) -- the same
-  !! "looks like a physical boundary" ambiguity this rank's OWN level-0
-  !! facets already have, deliberately, since level 1->2 remains rank-local
-  !! and unprotected (out of scope for this fix).
+  !! owned side stored (in LOCAL numbering, label - owned_lo) -- this is
+  !! the genuine "physical boundary, or the ghost halo simply didn't reach
+  !! far enough" ambiguity a one-vertex-layer halo cannot resolve at any
+  !! level; it is not a scope limitation of this routine.
   !! @param n_verts_keep  this rank's own (unextended) vertex count
   !! @param owned_lo, owned_hi  my macro ids are the range (owned_lo, owned_hi]
   subroutine macro_topology_build_next_level_owned(this, mmshC, n_verts_keep, &
@@ -879,6 +911,239 @@ contains
     end do
   end subroutine macro_topology_build_next_level_owned
 
+  !> Invert face_el/face_nel into an element -> incident-face CSR list.
+  !! Generic (any level): a facet's incident elements are already stored
+  !! as plain element indices regardless of arity.
+  subroutine macro_mesh_elem_face_csr(mmsh, eface_ptr, eface_idx)
+    type(macro_mesh_t), intent(in) :: mmsh
+    integer(i4), allocatable, intent(out) :: eface_ptr(:), eface_idx(:)
+    integer(i4), allocatable :: fill(:)
+    integer(i4) :: f, s, e
+
+    allocate(eface_ptr(mmsh%n_elem + 1))
+    eface_ptr = 0
+    do f = 1, mmsh%n_face
+       do s = 1, mmsh%face_nel(f)
+          e = mmsh%face_el(s, f)
+          eface_ptr(e + 1) = eface_ptr(e + 1) + 1
+       end do
+    end do
+    do e = 1, mmsh%n_elem
+       eface_ptr(e + 1) = eface_ptr(e + 1) + eface_ptr(e)
+    end do
+    allocate(eface_idx(eface_ptr(mmsh%n_elem + 1)))
+    allocate(fill(mmsh%n_elem))
+    fill = 0
+    do f = 1, mmsh%n_face
+       do s = 1, mmsh%face_nel(f)
+          e = mmsh%face_el(s, f)
+          fill(e) = fill(e) + 1
+          eface_idx(eface_ptr(e) + fill(e)) = f
+       end do
+    end do
+  end subroutine macro_mesh_elem_face_csr
+
+  !> Splice ghost elements' own vertex/face/edge CSR sub-tables (as
+  !! received from neighboring ranks) into a copy of this rank's own
+  !! mesh, producing a ghost-extended macro_mesh_t. This REPLACES the
+  !! level-0-only approach of re-deriving facet structure from a raw
+  !! vertex list via a fixed element-type template (macro_mesh_init_hex):
+  !! above level 0, a macroelement's faces/edges are not derivable from
+  !! its vertex set at all -- they exist only because they were
+  !! inherited from the level below -- so a ghost element's OWN
+  !! already-computed face/edge sub-tables (extracted by the SENDING
+  !! rank from its own mmsh, see build_ghost_payload_local in
+  !! amge_coarsen.f90) must be shipped over and grafted on, not
+  !! recomputed.
+  !!
+  !! Splicing works by identity, not by re-derivation: a face's identity
+  !! is its (global-id) vertex SET, an edge's is its vertex PAIR. Ghost
+  !! faces/edges are matched against the local mesh's own tables (and
+  !! against each other, in case two ghost elements from possibly
+  !! different ranks are mutually adjacent) purely by that identity; a
+  !! match against a local face with face_nel==1 is exactly the case
+  !! this whole mechanism exists for -- a facet that looked like a
+  !! physical boundary locally turns out to have a real neighbor.
+  !!
+  !! Ghost elements are appended as new elements
+  !! [mmsh%n_elem+1, mmsh%n_elem+n_ghost] in the element-index space
+  !! topo%init_tables' part(:) argument uses; the caller builds part_ext
+  !! accordingly (local macro ids offset, then ghost gmacro verbatim --
+  !! unchanged from the previous hex-only mechanism).
+  !!
+  !! @param g_vtx_ptr/idx     (n_ghost+1)/CSR global vertex ids per ghost element
+  !! @param g_face_ptr        (n_ghost+1) CSR: faces per ghost element
+  !! @param g_fv_ptr/idx      CSR (over the flat ghost-face list): global
+  !!                          vertex ids per ghost face
+  !! @param g_fe_ptr          CSR (over the flat ghost-face list): bounding
+  !!                          edges per ghost face
+  !! @param g_fe_vtx          (2, *) global vertex id endpoints, one pair
+  !!                          per bounding edge, in g_fe_ptr order
+  subroutine macro_mesh_splice_ghost(mmsh, n_ghost, g_vtx_ptr, g_vtx_idx, &
+       g_face_ptr, g_fv_ptr, g_fv_idx, g_fe_ptr, g_fe_vtx, mmsh_ext)
+    type(macro_mesh_t), intent(in) :: mmsh
+    integer(i4), intent(in) :: n_ghost
+    integer(i4), intent(in) :: g_vtx_ptr(:), g_vtx_idx(:)
+    integer(i4), intent(in) :: g_face_ptr(:), g_fv_ptr(:), g_fv_idx(:)
+    integer(i4), intent(in) :: g_fe_ptr(:)
+    integer(i4), intent(in) :: g_fe_vtx(:,:)
+    type(macro_mesh_t), intent(inout) :: mmsh_ext
+
+    integer(i4), allocatable :: g2l(:)
+    integer(i4), allocatable :: vert_id2(:)
+    logical, allocatable :: shared_vtx2(:)
+    type(vset_map_t) :: fmap
+    type(tuple_map_t) :: emap
+    integer(i4), allocatable :: face_el2(:,:), face_nel2(:)
+    integer(i4), allocatable :: face_vtx_ptr2(:), face_vtx_idx2(:)
+    integer(i4), allocatable :: face_edge_ptr2(:), face_edge_idx2(:)
+    integer(i4), allocatable :: edge_vtx2(:,:)
+    integer(i4), allocatable :: verts_loc(:), key(:)
+    integer(i4) :: n_gf, n_gvref, n_geref, n_gfvref
+    integer(i4) :: max_gid, nv_ext, nf, ne, pos_fv, pos_fe
+    integer(i4) :: e, f, g, ge, j, k, nvf, nef, val, pr(2)
+
+    call mmsh_ext%free()
+    n_gf = g_face_ptr(n_ghost + 1)
+    n_gvref = g_vtx_ptr(n_ghost + 1)
+    if (n_gf .gt. 0) then
+       n_geref = g_fe_ptr(n_gf + 1)
+       n_gfvref = g_fv_ptr(n_gf + 1)
+    else
+       n_geref = 0
+       n_gfvref = 0
+    end if
+
+    ! ---------------- vertices: direct-address global -> local map ----
+    max_gid = maxval(mmsh%vert_id)
+    if (n_gvref .gt. 0) max_gid = max(max_gid, maxval(g_vtx_idx))
+    allocate(g2l(max(max_gid, 1)))
+    g2l = 0
+    allocate(vert_id2(mmsh%n_verts + n_gvref))
+    allocate(shared_vtx2(mmsh%n_verts + n_gvref))
+    shared_vtx2 = .false.
+    do e = 1, mmsh%n_verts
+       g2l(mmsh%vert_id(e)) = e
+       vert_id2(e) = mmsh%vert_id(e)
+       if (allocated(mmsh%shared_vtx)) shared_vtx2(e) = mmsh%shared_vtx(e)
+    end do
+    nv_ext = mmsh%n_verts
+    do j = 1, n_gvref
+       g = g_vtx_idx(j)
+       if (g2l(g) .eq. 0) then
+          nv_ext = nv_ext + 1
+          g2l(g) = nv_ext
+          vert_id2(nv_ext) = g
+       end if
+    end do
+
+    ! ---------------- edges: seed with the local mesh's own edges -----
+    call tmap_init(emap, mmsh%n_edge + n_geref)
+    allocate(edge_vtx2(2, mmsh%n_edge + n_geref))
+    do g = 1, mmsh%n_edge
+       pr = mmsh%edge_vtx(:, g)
+       call sort2(pr)
+       call tmap_find_or_add(emap, [pr(1), pr(2), 0, 0], g, val)
+       edge_vtx2(:, g) = mmsh%edge_vtx(:, g)
+    end do
+    ne = mmsh%n_edge
+
+    ! ---------------- faces: seed with the local mesh's own faces -----
+    call vmap_init(fmap, mmsh%n_face + n_gf)
+    allocate(face_el2(2, mmsh%n_face + n_gf), face_nel2(mmsh%n_face + n_gf))
+    allocate(face_vtx_ptr2(mmsh%n_face + n_gf + 1))
+    allocate(face_edge_ptr2(mmsh%n_face + n_gf + 1))
+    allocate(face_vtx_idx2(mmsh%face_vtx_ptr(mmsh%n_face + 1) + n_gfvref))
+    allocate(face_edge_idx2(mmsh%face_edge_ptr(mmsh%n_face + 1) + n_geref))
+    face_vtx_ptr2(1) = 0
+    face_edge_ptr2(1) = 0
+    do f = 1, mmsh%n_face
+       face_nel2(f) = mmsh%face_nel(f)
+       face_el2(:, f) = mmsh%face_el(:, f)
+       nvf = mmsh%face_vtx_ptr(f + 1) - mmsh%face_vtx_ptr(f)
+       face_vtx_ptr2(f + 1) = face_vtx_ptr2(f) + nvf
+       face_vtx_idx2(face_vtx_ptr2(f) + 1 : face_vtx_ptr2(f + 1)) = &
+            mmsh%face_vtx_idx(mmsh%face_vtx_ptr(f) + 1 : mmsh%face_vtx_ptr(f + 1))
+       nef = mmsh%face_edge_ptr(f + 1) - mmsh%face_edge_ptr(f)
+       face_edge_ptr2(f + 1) = face_edge_ptr2(f) + nef
+       face_edge_idx2(face_edge_ptr2(f) + 1 : face_edge_ptr2(f + 1)) = &
+            mmsh%face_edge_idx(mmsh%face_edge_ptr(f) + 1 : mmsh%face_edge_ptr(f + 1))
+       allocate(key(mmsh%face_vtx_ptr(f + 1) - mmsh%face_vtx_ptr(f)))
+       key = mmsh%face_vtx_idx(mmsh%face_vtx_ptr(f) + 1 : mmsh%face_vtx_ptr(f + 1))
+       call sort_i4_local(key)
+       call vmap_find_or_add(fmap, key, f, val)
+       deallocate(key)
+    end do
+    nf = mmsh%n_face
+    pos_fv = mmsh%face_vtx_ptr(mmsh%n_face + 1)
+    pos_fe = mmsh%face_edge_ptr(mmsh%n_face + 1)
+
+    ! ---------------- splice each ghost element's faces ----------------
+    do ge = 1, n_ghost
+       do j = g_face_ptr(ge) + 1, g_face_ptr(ge + 1)
+          nvf = g_fv_ptr(j + 1) - g_fv_ptr(j)
+          allocate(verts_loc(nvf))
+          do k = 1, nvf
+             verts_loc(k) = g2l(g_fv_idx(g_fv_ptr(j) + k))
+          end do
+          allocate(key(nvf))
+          key = verts_loc
+          call sort_i4_local(key)
+          call vmap_find_or_add(fmap, key, nf + 1, val)
+          if (val .eq. nf + 1) then
+             ! brand new face: register its vertex/edge content
+             nf = val
+             face_vtx_ptr2(nf + 1) = face_vtx_ptr2(nf) + nvf
+             face_vtx_idx2(face_vtx_ptr2(nf) + 1 : face_vtx_ptr2(nf + 1)) = verts_loc
+             nef = g_fe_ptr(j + 1) - g_fe_ptr(j)
+             face_edge_ptr2(nf + 1) = face_edge_ptr2(nf) + nef
+             do k = 1, nef
+                pr(1) = g2l(g_fe_vtx(1, g_fe_ptr(j) + k))
+                pr(2) = g2l(g_fe_vtx(2, g_fe_ptr(j) + k))
+                call sort2(pr)
+                call tmap_find_or_add(emap, [pr(1), pr(2), 0, 0], ne + 1, val)
+                if (val .eq. ne + 1) then
+                   ne = val
+                   edge_vtx2(:, ne) = pr
+                end if
+                face_edge_idx2(face_edge_ptr2(nf) + k) = val
+             end do
+             pos_fv = face_vtx_ptr2(nf + 1)
+             pos_fe = face_edge_ptr2(nf + 1)
+             face_nel2(nf) = 1
+             face_el2(1, nf) = mmsh%n_elem + ge
+             face_el2(2, nf) = 0
+          else
+             ! matched an existing face (local, or an earlier ghost's) --
+             ! a facet has at most two incident elements, ever
+             if (face_nel2(val) .ne. 1) call neko_error( &
+                  'macro_mesh_splice_ghost: facet already has 2 incident ' // &
+                  'elements -- vertex-set collision or data corruption')
+             face_nel2(val) = 2
+             face_el2(2, val) = mmsh%n_elem + ge
+          end if
+          deallocate(verts_loc, key)
+       end do
+    end do
+
+    mmsh_ext%n_verts = nv_ext
+    mmsh_ext%n_elem = mmsh%n_elem + n_ghost
+    mmsh_ext%n_face = nf
+    mmsh_ext%n_edge = ne
+    mmsh_ext%vert_id = vert_id2(1:nv_ext)
+    mmsh_ext%shared_vtx = shared_vtx2(1:nv_ext)
+    mmsh_ext%edge_vtx = edge_vtx2(:, 1:ne)
+    mmsh_ext%face_el = face_el2(:, 1:nf)
+    mmsh_ext%face_nel = face_nel2(1:nf)
+    mmsh_ext%face_vtx_ptr = face_vtx_ptr2(1:nf + 1)
+    mmsh_ext%face_vtx_idx = face_vtx_idx2(1:pos_fv)
+    mmsh_ext%face_edge_ptr = face_edge_ptr2(1:nf + 1)
+    mmsh_ext%face_edge_idx = face_edge_idx2(1:pos_fe)
+
+    call vmap_free(fmap)
+    call tmap_free(emap)
+  end subroutine macro_mesh_splice_ghost
+
   !> Deallocate a level table set.
   subroutine macro_mesh_free(this)
     class(macro_mesh_t), intent(inout) :: this
@@ -1033,6 +1298,86 @@ contains
        if (probe .gt. map%cap) probe = 1
     end do
   end subroutine tmap_find_or_add
+
+  ! ---- variable-length sorted-vertex-set map (see vset_map_t) ----
+  subroutine vmap_init(map, cap_hint)
+    type(vset_map_t), intent(inout) :: map
+    integer(i4), intent(in) :: cap_hint
+    map%cap = 2 * cap_hint + 17
+    allocate(map%keys(map%cap), map%val(map%cap))
+    map%n = 0
+  end subroutine vmap_init
+
+  subroutine vmap_free(map)
+    type(vset_map_t), intent(inout) :: map
+    integer(i4) :: i
+    if (allocated(map%keys)) then
+       do i = 1, map%cap
+          if (allocated(map%keys(i)%v)) deallocate(map%keys(i)%v)
+       end do
+       deallocate(map%keys)
+    end if
+    if (allocated(map%val)) deallocate(map%val)
+    map%cap = 0; map%n = 0
+  end subroutine vmap_free
+
+  !> key must already be sorted ascending. Find; if absent and
+  !! new_val >= 0, insert with new_val. Returns the stored value, or -1
+  !! if absent and new_val < 0.
+  subroutine vmap_find_or_add(map, key, new_val, val)
+    type(vset_map_t), intent(inout) :: map
+    integer(i4), intent(in) :: key(:), new_val
+    integer(i4), intent(out) :: val
+    integer(i8) :: h
+    integer(i4) :: s, probe
+
+    h = 1469598103934665603_i8
+    h = ieor(h, int(size(key), i8)) * 1099511628211_i8
+    do s = 1, size(key)
+       h = ieor(h, int(key(s), i8)) * 1099511628211_i8
+    end do
+    probe = int(modulo(h, int(map%cap, i8)), i4) + 1
+    do
+       if (.not. allocated(map%keys(probe)%v)) then
+          if (new_val .lt. 0) then
+             val = -1
+             return
+          end if
+          if (map%n .ge. map%cap / 2) &
+               call neko_error('macro_topology: vertex-set map over half full')
+          map%keys(probe)%v = key
+          map%val(probe) = new_val
+          map%n = map%n + 1
+          val = new_val
+          return
+       end if
+       if (size(map%keys(probe)%v) .eq. size(key)) then
+          if (all(map%keys(probe)%v .eq. key)) then
+             val = map%val(probe)
+             return
+          end if
+       end if
+       probe = probe + 1
+       if (probe .gt. map%cap) probe = 1
+    end do
+  end subroutine vmap_find_or_add
+
+  !> Insertion sort for a variable-length key array (small arrays only --
+  !! macrofaces/ghost element vertex counts, not fine dof counts).
+  pure subroutine sort_i4_local(a)
+    integer(i4), intent(inout) :: a(:)
+    integer(i4) :: i, j, t
+    do i = 2, size(a)
+       t = a(i)
+       j = i - 1
+       do while (j .ge. 1)
+          if (a(j) .le. t) exit
+          a(j + 1) = a(j)
+          j = j - 1
+       end do
+       a(j + 1) = t
+    end do
+  end subroutine sort_i4_local
 
   ! ---- small sorts ----
   pure subroutine sort2(a)
