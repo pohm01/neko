@@ -83,6 +83,7 @@ contains
     integer(i4) :: i, j, tmp
     integer(i4), allocatable :: rand_order(:)
     real(kind=rp) :: r
+    integer(i4), allocatable :: sizes(:)   !< debug: final size of each cluster
 
     ne = lvl%mmsh%n_elem
     if (allocated(part)) deallocate(part)
@@ -137,6 +138,7 @@ contains
     part = 0
     n_macro = 0
     allocate(frontier(ne), infr(ne))
+    allocate(sizes(ne))   ! upper bound on n_macro; only sizes(1:n_macro) used
     do i = 1, ne
        s = rand_order(i)
        if (part(s) .ne. 0) cycle
@@ -189,7 +191,11 @@ contains
              end if
           end do
        end do
+       sizes(n_macro) = cnt
     end do
+
+    if (AMGE_DEBUG_CHECKS) call report_size_stats('agglomeration: elements/macroelement', &
+         sizes(1:n_macro))
   end subroutine agglomerate_level
 
   !> One coarsening step: lvl + part -> coarse level lvlC + transfer tr
@@ -220,6 +226,7 @@ contains
     real(rp), allocatable :: am(:,:), qdm(:,:)
     real(rp), allocatable :: w(:)
     integer(i4) :: m, e, k, a, q, v, nd, nb, nc, nmv
+    integer(i4), allocatable :: dsizes(:)   !< debug: coarse dofs per macroelement
     logical :: ghosted
     type(schur_check_t) :: schk
     type(amge_ghost_t) :: gh
@@ -367,6 +374,7 @@ contains
     marke = .false.
 
     ! first pass counts coarse dofs per macroelement to size elm_vtx_ptr
+    allocate(dsizes(n_macro))
     do m = 1, n_macro
        call macro_dof_list(lvl, melems(m)%x, markv, tr%maps(m)%fdofs)
        nc = 0
@@ -374,8 +382,10 @@ contains
           if (topo%is_mv(tr%maps(m)%fdofs(a))) nc = nc + 1
        end do
        lvlC%elm_vtx_ptr(m + 1) = lvlC%elm_vtx_ptr(m) + nc
+       dsizes(m) = nc
     end do
     allocate(lvlC%elm_vtx_idx(lvlC%elm_vtx_ptr(n_macro + 1)))
+    if (AMGE_DEBUG_CHECKS) call report_size_stats('coarse dofs/macroelement', dsizes)
 
     do m = 1, n_macro
        associate (mp => tr%maps(m))
@@ -1207,5 +1217,27 @@ contains
        a(j + 1) = t
     end do
   end subroutine sort_i4
+
+  !> Debug helper: print min/avg/median/max of an integer size array
+  !! (aggregate sizes, coarse dofs per macroelement, ...) in one common
+  !! format, gated by the caller on AMGE_DEBUG_CHECKS.
+  subroutine report_size_stats(label, sizes)
+    character(len=*), intent(in) :: label
+    integer(i4), intent(in) :: sizes(:)
+    integer(i4), allocatable :: sorted(:)
+    real(rp) :: avg, med
+    integer(i4) :: n
+    n = size(sizes)
+    sorted = sizes
+    call sort_i4(sorted)
+    avg = real(sum(sizes), rp) / real(n, rp)
+    if (mod(n, 2) == 1) then
+       med = real(sorted((n + 1) / 2), rp)
+    else
+       med = 0.5_rp * real(sorted(n / 2) + sorted(n / 2 + 1), rp)
+    end if
+    write(*, '("   [check] ", A, " (n=", I0, "): min/avg/median/max = ", &
+         & I0, "/", F6.2, "/", F6.2, "/", I0)') label, n, sorted(1), avg, med, sorted(n)
+  end subroutine report_size_stats
 
 end module amge_coarsen
