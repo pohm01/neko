@@ -113,14 +113,14 @@ contains
     do i = 1, ne
        rand_order(i) = i
     end do
-    ! Shuffle rand_order using Fisher-Yates algorithm
-    do i = ne, 2, -1
-       call random_number(r)
-       j = int(r * real(i, kind=rp)) + 1
-       tmp = rand_order(i)
-       rand_order(i) = rand_order(j)
-       rand_order(j) = tmp
-    end do
+    !! Shuffle rand_order using Fisher-Yates algorithm
+    !do i = ne, 2, -1
+    !   call random_number(r)
+    !   j = int(r * real(i, kind=rp)) + 1
+    !   tmp = rand_order(i)
+    !   rand_order(i) = rand_order(j)
+    !   rand_order(j) = tmp
+    !end do
 
     part = 0
     n_macro = 0

@@ -269,16 +269,6 @@ contains
     end do
     call macro_mesh_init_hex(lvl%mmsh, msh%nelv, hv)
 
-    npts = msh%mpts
-    if (.not.(npts == lvl%mmsh%n_verts)) then
-      print *, "VERT COUNTING ISSUE!"
-    end if
-    ! g2l is indexed by GLOBAL vertex id, which ranges up to msh%glb_mpts
-    ! (the mesh-wide unique point count) -- NOT msh%mpts (this rank's own
-    ! local unique point count, "npts" above). Sizing to npts was an
-    ! out-of-bounds write on every rank whose elements reference global
-    ! ids beyond its own small local count, i.e. on any real MPI partition;
-    ! it only happened to be safe on a single rank, where glb_mpts == mpts.
     allocate(g2l(msh%glb_mpts))
     g2l = 0
     do v = 1, lvl%mmsh%n_verts
