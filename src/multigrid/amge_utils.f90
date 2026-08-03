@@ -298,17 +298,55 @@ contains
     ! trace maps agree with every other rank's on a shared macroedge/face
     ! (eq. 56), not merely self-consistent with this rank's own data.
     cerr = 0.0_rp
-    do m = 1, lvc%tr%n_melm
-       associate (mp => lvc%tr%maps(m))
-         do q = 1, size(mp%cdofs)
-            cv = lvc%mmsh%vert_id(mp%cdofs(q))
-            do a = 1, size(mp%fdofs)
-               fv = lvf%mmsh%vert_id(mp%fdofs(a))
-               cerr = max(cerr, abs(mp%PiTilde%x(a, q) - p(fv, cv)))
-            end do
+    block
+      integer(i4) :: worst_m, worst_a, worst_q, mm, aa, qq
+      worst_m = 0; worst_a = 0; worst_q = 0
+      do m = 1, lvc%tr%n_melm
+         associate (mp => lvc%tr%maps(m))
+           do q = 1, size(mp%cdofs)
+              cv = lvc%mmsh%vert_id(mp%cdofs(q))
+              do a = 1, size(mp%fdofs)
+                 fv = lvf%mmsh%vert_id(mp%fdofs(a))
+                 if (abs(mp%PiTilde%x(a, q) - p(fv, cv)) .gt. cerr) then
+                    cerr = abs(mp%PiTilde%x(a, q) - p(fv, cv))
+                    worst_m = m; worst_a = a; worst_q = q
+                 end if
+              end do
+           end do
+         end associate
+      end do
+      ! TEMP DEBUG: dump every macroelement's own contribution at the
+      ! worst-offending (fv, cv) pair, to see whether they genuinely
+      ! disagree (real trace-incompatibility) or whether only one
+      ! macroelement contributes non-zero winv-scaled mass.
+      if (cerr .gt. 1.0e-8_rp .and. pe_rank .eq. 0 .and. worst_m .gt. 0) then
+         associate (mp => lvc%tr%maps(worst_m))
+           cv = lvc%mmsh%vert_id(mp%cdofs(worst_q))
+           fv = lvf%mmsh%vert_id(mp%fdofs(worst_a))
+         end associate
+         write(*, '("   [debug] worst conformity: fv=", I0, " cv=", I0, &
+              & " p_glb=", ES14.6, " w(fv)=", ES14.6)') fv, cv, p(fv, cv), &
+              1.0_rp / lvc%tr%winv(lvc%tr%maps(worst_m)%fdofs(worst_a))
+         do mm = 1, lvc%tr%n_melm
+            associate (mp2 => lvc%tr%maps(mm))
+              ! is fv itself a coarse dof (macrovertex) of this macroelement?
+              do qq = 1, size(mp2%cdofs)
+                 if (lvc%mmsh%vert_id(mp2%cdofs(qq)) .eq. fv) &
+                      write(*, '("   [debug]   macroelm ", I0, " has fv AS ITS OWN cdof q=", &
+                           & I0)') mm, qq
+              end do
+              do qq = 1, size(mp2%cdofs)
+                 if (lvc%mmsh%vert_id(mp2%cdofs(qq)) .ne. cv) cycle
+                 do aa = 1, size(mp2%fdofs)
+                    if (lvf%mmsh%vert_id(mp2%fdofs(aa)) .ne. fv) cycle
+                    write(*, '("   [debug]   macroelm ", I0, " Pi(a=", I0, &
+                         & ",q=", I0, ") = ", ES14.6)') mm, aa, qq, mp2%PiTilde%x(aa, qq)
+                 end do
+              end do
+            end associate
          end do
-       end associate
-    end do
+      end if
+    end block
     rerr = maxval(abs(sum(ac, dim=2)))
     serr = maxval(abs(ac - transpose(ac)))
     if (pe_rank .eq. 0) then
@@ -449,6 +487,21 @@ contains
   !! @param coef  geometry/metric coefficients
   !! @param Xh    function space (gives lxyz, and the corner-node indices)
   !! @param msh   Neko mesh
+  !! DIRICHLET BOUNDARY CONDITIONS. Periodic dofs are already identified
+  !! (via coef%dof, same as amge_gs.f90's shared_vtx) and Neumann needs no
+  !! special treatment (a natural condition in the weak form ax_t already
+  !! encodes). Homogeneous Dirichlet (the residual/correction this
+  !! hierarchy solves for is exactly 0 there) is applied HERE, once, at
+  !! the finest level, by zeroing the row AND column of every Dirichlet
+  !! local dof in each element's full lxyz x lxyz block before it is ever
+  !! condensed or coarsened -- the standard FEM Dirichlet-elimination
+  !! trick. Everything downstream (agglomeration, macrovertex/macroedge/
+  !! macroface extraction, schur_extend, the smoother) is generic in
+  !! AM(e)/mesh connectivity and needs no BC-awareness of its own: once a
+  !! dof's row/col is isolated here, schur_extend's pseudoinverse of the
+  !! (now block-diagonal-at-that-dof) interior block automatically gives
+  !! it a zero row of PiTilde at every subsequent level, so no coarse
+  !! correction is ever prolonged onto it.
   subroutine amge_fill_AM_from_ax(lvl, ax, coef, Xh, msh, blst)
     type(amge_level_t), intent(inout) :: lvl
     class(ax_t), intent(inout) :: ax
@@ -456,9 +509,12 @@ contains
     type(space_t), intent(inout) :: Xh
     type(mesh_t), intent(inout) :: msh
     type(bc_list_t), target, intent(inout) :: blst
-    real(rp), allocatable :: u(:,:), w(:,:)
+    real(rp), allocatable, target :: u(:,:), w(:,:)
+    real(rp), allocatable, target :: sentinel(:,:)
+    real(rp), pointer :: u_flat(:), w_flat(:), sentinel_flat(:)
     real(rp), allocatable :: Ae(:,:)            ! full lxyz x lxyz element block
     integer(i4), allocatable :: corner(:)       ! lxyz-index of each of the 8 corners
+    logical, allocatable :: is_dirichlet(:,:)   ! (nxyz, nelv) local dof mask
     integer(i4) :: nxyz, e, col, i
     integer :: n
 
@@ -467,6 +523,25 @@ contains
     call corner_node_indices(Xh, corner)        ! the 8 tensor-grid corners
 
     allocate(u(nxyz, msh%nelv), w(nxyz, msh%nelv), Ae(nxyz, nxyz))
+    ! blst%apply takes a flat (n) array; bc_list_t's dummy is explicit-
+    ! shape, so a rank-2 actual doesn't sequence-associate through the
+    ! GENERIC apply binding (gfortran rejects it) -- rank-remap a pointer
+    ! onto the SAME storage instead of copying.
+    u_flat(1:n) => u
+    w_flat(1:n) => w
+
+    ! ---- which (local node, element) pairs are strongly Dirichlet -----
+    ! detect via a sentinel value: blst%apply overwrites a Dirichlet entry
+    ! with its target g (0 for the residual/correction field this
+    ! hierarchy solves); any entry that changed from the untouched
+    ! sentinel was written by some bc in blst. Works regardless of g's
+    ! actual value as long as it isn't 1 (true for a homogeneous target).
+    allocate(sentinel(nxyz, msh%nelv), is_dirichlet(nxyz, msh%nelv))
+    sentinel_flat(1:n) => sentinel
+    sentinel = 1.0_rp
+    call blst%apply(sentinel_flat, n)
+    is_dirichlet = (sentinel .ne. 1.0_rp)
+    deallocate(sentinel)
 
     ! ---- probe: one ax_t apply per local column materializes column j of
     !      every element's block simultaneously (all elements share the
@@ -480,22 +555,32 @@ contains
     do col = 1, nxyz
        u = 0.0_rp
        u(col, :) = 1.0_rp                         ! unit vector at local node col, all elements
+       ! never perturb a Dirichlet dof (zeros that column)
+       call blst%apply(u_flat, n)
        call ax%compute(w, u, coef, msh, Xh)       ! UNASSEMBLED element action
+       ! and ignore whatever raw coupling the operator reports AT a
+       ! Dirichlet dof (zeros that row) -- together, the standard
+       ! zero-row-and-column Dirichlet elimination, applied per fine
+       ! element before any assembly/condensation happens
+       call blst%apply(w_flat, n)
        ! w(:,e) is now column `col` of element e's full local matrix
-       ! Would be nice if we could locally apply the BC here
-       ! and have it track through the rest of the problem
-       !call blst%apply_scalar(w, n)
-       do e = 1, msh%nelv
-          ! (handled per-element below to keep memory small; here we could
-          !  stash into a big buffer, but we condense element-by-element)
-       end do
-       ! stash this column into a per-element accumulator
        call stash_column(col, w, msh%nelv, nxyz)
+       !! Note, we could handle element-by-element to keep memory small,
+       !! but for now we just stash into a big buffer.
     end do
 
     ! ---- condense each element's full block onto its 8 corners ----
     do e = 1, msh%nelv
        call get_element_block(e, nxyz, Ae)        ! full lxyz x lxyz for element e
+       ! the row/col zeroing above leaves a Dirichlet dof's diagonal zero
+       ! too (an all-zero row+col+diagonal), which is singular -- and
+       ! condense_to_corners' interior solve needs an invertible A_II.
+       ! Restore a positive diagonal, decoupled from every other dof: the
+       ! standard convention, and what makes the elimination self-
+       ! propagate correctly through Schur condensation/coarsening.
+       do i = 1, nxyz
+          if (is_dirichlet(i, e)) Ae(i, i) = 1.0_rp
+       end do
        call condense_to_corners(Ae, nxyz, corner, lvl%AM(e)%x)
     end do
 
