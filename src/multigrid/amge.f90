@@ -190,6 +190,33 @@ contains
     call rt%free()
   end subroutine amge_smooth_l1
 
+  !> Literal l1-Jacobi sweep in cell-wise storage (admissible form
+  !! P = G D^{-1} G^T): for each sweep, form the cell-local dual residual
+  !! b~ - A u, assemble it (the one GS), scale by the assembled l1
+  !! diagonal, and gather the continuous correction back into the copies.
+  subroutine melm_smooth_l1_ua(lvl, dl1, u, bt, nu)
+    type(amge_level_t), intent(inout) :: lvl
+    real(rp), intent(in) :: dl1(:)            !< assembled l1 diagonal
+    type(amge_vec_t), intent(inout) :: u      !< primal iterate (continuous)
+    type(amge_vec_t), intent(in) :: bt        !< unassembled dual rhs
+    integer(i4), intent(in) :: nu
+    type(amge_vec_t) :: rt
+    integer(i4) :: it, e, p, off
+    call lvl%new_vec(rt)
+    do it = 1, nu
+       call amge_apply(lvl, u, rt)
+       rt%x = bt%x - rt%x !< NOTE RHS(bt) is unassembled.
+       call lvl%gsh%op(rt%x)
+       do e = 1, lvl%nelm()
+          off = lvl%elm_vtx_ptr(e)
+          do p = 1, lvl%ndof_el(e)
+             u%x(off + p) = u%x(off + p) + rt%x(off+p) / dl1(lvl%elm_vtx_idx(off + p))
+          end do
+       end do
+    end do
+    call rt%free()
+  end subroutine melm_smooth_l1_ua
+
   ! ================== hierarchy ==================
 
   !> Initialize a macroelement amg hierarchy from a neko mesh_t
