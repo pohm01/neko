@@ -127,14 +127,14 @@ contains
     do i = 1, ne
        rand_order(i) = i
     end do
-    ! Shuffle rand_order using Fisher-Yates algorithm
-    do i = ne, 2, -1
-       call random_number(r)
-       j = int(r * real(i, kind=rp)) + 1
-       tmp = rand_order(i)
-       rand_order(i) = rand_order(j)
-       rand_order(j) = tmp
-    end do
+    !! Shuffle rand_order using Fisher-Yates algorithm
+    !do i = ne, 2, -1
+    !   call random_number(r)
+    !   j = int(r * real(i, kind=rp)) + 1
+    !   tmp = rand_order(i)
+    !   rand_order(i) = rand_order(j)
+    !   rand_order(j) = tmp
+    !end do
 
     ! ---- greedy compact-growth clustering over rand_order. part(e)==0
     ! means "unassigned"; scanning rand_order in order and skipping
@@ -161,34 +161,34 @@ contains
           end if
        end do
 
-       if (nfr .eq. 0) then
-          ! s has no unassigned neighbor left to grow a new cluster into
-          ! -- every neighbor was already claimed by an earlier cluster.
-          ! Rather than leave s as its own singleton macroelement (a
-          ! degenerate coarse dof), fold it into whichever already-
-          ! assigned neighboring macroelement it shares the most facets
-          ! with. Only a genuinely isolated element (no facet neighbors
-          ! at all) falls through to become a singleton below.
-          block
-            integer(i4) :: best_id, best_cnt, qa, qb, deg
-            best_id = 0; best_cnt = 0
-            do qa = adj_ptr(s) + 1, adj_ptr(s + 1)
-               if (part(adj_idx(qa)) .eq. 0) cycle
-               deg = 0
-               do qb = adj_ptr(s) + 1, adj_ptr(s + 1)
-                  if (part(adj_idx(qb)) .eq. part(adj_idx(qa))) deg = deg + 1
-               end do
-               if (deg .gt. best_cnt) then
-                  best_cnt = deg; best_id = part(adj_idx(qa))
-               end if
-            end do
-            if (best_id .gt. 0) then
-               part(s) = best_id
-               sizes(best_id) = sizes(best_id) + 1
-               cycle
-            end if
-          end block
-       end if
+       !if (nfr .eq. 0) then
+       !   ! s has no unassigned neighbor left to grow a new cluster into
+       !   ! -- every neighbor was already claimed by an earlier cluster.
+       !   ! Rather than leave s as its own singleton macroelement (a
+       !   ! degenerate coarse dof), fold it into whichever already-
+       !   ! assigned neighboring macroelement it shares the most facets
+       !   ! with. Only a genuinely isolated element (no facet neighbors
+       !   ! at all) falls through to become a singleton below.
+       !   block
+       !     integer(i4) :: best_id, best_cnt, qa, qb, deg
+       !     best_id = 0; best_cnt = 0
+       !     do qa = adj_ptr(s) + 1, adj_ptr(s + 1)
+       !        if (part(adj_idx(qa)) .eq. 0) cycle
+       !        deg = 0
+       !        do qb = adj_ptr(s) + 1, adj_ptr(s + 1)
+       !           if (part(adj_idx(qb)) .eq. part(adj_idx(qa))) deg = deg + 1
+       !        end do
+       !        if (deg .gt. best_cnt) then
+       !           best_cnt = deg; best_id = part(adj_idx(qa))
+       !        end if
+       !     end do
+       !     if (best_id .gt. 0) then
+       !        part(s) = best_id
+       !        sizes(best_id) = sizes(best_id) + 1
+       !        cycle
+       !     end if
+       !   end block
+       !end if
 
        ! seed a new cluster at s (frontier already built above)
        n_macro = n_macro + 1

@@ -195,6 +195,16 @@ module amge_topology
   integer(i4), parameter :: loc_edge(2,12) = reshape( &
        [1,2, 1,3, 1,5, 2,4, 2,6, 3,4, 3,7, 4,8, 5,6, 5,7, 6,8, 7,8], [2,12])
 
+  !> Skeleton rule (c) ("dihedral crease": two same-label facets sharing a
+  !! fine element). This rule has issues with jagged interfaces.
+  !! Set .false. to disable.
+  logical, public :: amge_use_crease_rule = .true.
+  !> Diagnostic: how many skeleton edges each rule produced in the last
+  !! call to init_tables (label rule, incidence rule, crease rule).
+  integer(i4) :: amge_nskel_label = 0
+  integer(i4) :: amge_nskel_incid = 0
+  integer(i4) :: amge_nskel_crease = 0
+
   integer(i4), parameter :: MAX_SIG_LEN = 16  !< max labels per edge signature
 
 contains
@@ -310,6 +320,10 @@ contains
     integer(i4) :: e, f, g, v, a, b, q, nf, ne, nv, deg, nu, r
     integer(i4) :: n_exp, v0, cur, nxt, ge, cnt, grp, ngrp, tclen, telen
 
+    amge_nskel_label = 0
+    amge_nskel_incid = 0
+    amge_nskel_crease = 0
+
     call this%free()
     nf = mmsh%n_face
     ne = mmsh%n_edge
@@ -396,16 +410,24 @@ contains
        end do
        if (nu .ge. 2) then
           is_skel(g) = .true.
+          amge_nskel_label = amge_nskel_label + 1
        else if (deg .ne. 2) then
           is_skel(g) = .true.
-       else
+          amge_nskel_incid = amge_nskel_incid + 1
+       else if (amge_use_crease_rule) then
           ! rule (c): two same-label facets sharing an element = crease
           a = ef_adj(ef_xadj(g) + 1); b = ef_adj(ef_xadj(g) + 2)
           if (facets_share_element(mmsh%face_el(:, a), mmsh%face_nel(a), &
-               mmsh%face_el(:, b), mmsh%face_nel(b))) is_skel(g) = .true.
+               mmsh%face_el(:, b), mmsh%face_nel(b))) then
+             is_skel(g) = .true.
+             amge_nskel_crease = amge_nskel_crease + 1
+          end if
        end if
        if (is_skel(g)) edge_sig(g) = sig_lookup(sig_dat, sig_len, n_sig, labs(1:nu))
     end do
+    !print *, "LABEL", amge_nskel_label
+    !print *, "INCID", amge_nskel_incid
+    !print *, "CREASE", amge_nskel_crease
 
     ! ---------------- phase 5: macrovertices ------------------------------
     allocate(vdeg(nv), vsig(nv), this%is_mv(nv))
@@ -641,11 +663,30 @@ contains
             do a = 1, size(mf%verts)
                if (this%is_mv(mf%verts(a))) cnt = cnt + 1
             end do
-            if (cnt .eq. 0) call neko_error( &
-                 'macro_topology: closed macroface without boundary (not handled)')
+            if (cnt .eq. 0) then
+               ! Closed macroface: a fully wrapped-around patch (no rim
+               ! edge ever failed rules (a)/(b)/(c), so its boundary
+               ! never breaks open) with no macrovertex among its own
+               ! vertices either -- face_split would otherwise see
+               ! nb==0 boundary vertices, leaving Q_F with nothing to
+               ! anchor its trace map to. Mirror the closed-macroEDGE
+               ! fallback above (the loop-breakpoint promotion just
+               ! before phase 7): promote the patch's own
+               ! lowest-global-id vertex to a macrovertex, giving
+               ! face_split exactly one boundary vertex instead of an
+               ! unanchored patch.
+               v = mf%verts(1)
+               do a = 2, size(mf%verts)
+                  if (this%vert_id(mf%verts(a)) .lt. this%vert_id(v)) v = mf%verts(a)
+               end do
+               this%is_mv(v) = .true.
+            end if
          end if
        end associate
     end do
+    ! phase 5's count can be stale if the loop above promoted any new
+    ! macrovertices to anchor a closed macroface
+    this%n_mv = count(this%is_mv)
   end subroutine macro_topology_init_tables
 
   !> Emit the next level's generic tables from this extraction: macroedges
