@@ -19,6 +19,7 @@ module amge
        check_spsd, check_constant_reproduction, &
        amge_fill_AM_from_ax, q1_hex
   use amge_gs, only : amge_mesh_set_shared_from_dofmap
+  use profiler, only : profiler_start_region, profiler_end_region
   implicit none
   private
 
@@ -327,9 +328,12 @@ contains
   subroutine amge_flat_vcycle(this)
     class(amge_hierarchy_t), intent(inout) :: this
     integer :: l, lmax, si
+    character(len=2) :: lvl_name
     lmax = this%nlvls-1
     ! Traverse down hierarchy to coarse grid
     do l = 0, lmax-1
+       write(lvl_name, '(I0)') l
+       call profiler_start_region( "AMGe_level_" // trim(lvl_name))
        associate( lvl => this%lvl(l), lc => this%lvl(l+1) )
          call amge_smooth_l1(lvl, lvl%dl1, lvl%x, lvl%b, lvl%sm_itr)
          call calc_resid(lvl, lvl%r, lvl%x, lvl%b)
@@ -338,18 +342,25 @@ contains
          call lc%gsh%op(lc%b%x)
          call rzero(lc%x%x, lc%x%n_dofs)
        end associate
+       call profiler_end_region( "AMGe_level_" // trim(lvl_name))
     end do
     ! Coarse grid solve
+    write(lvl_name, '(I0)') lmax
+    call profiler_start_region( "AMGe_level_" // trim(lvl_name))
     associate( lvl => this%lvl(lmax) )
       call amge_smooth_l1(lvl, lvl%dl1, lvl%x, lvl%b, lvl%sm_itr)
     end associate
+    call profiler_end_region( "AMGe_level_" // trim(lvl_name))
     ! Traverse up hierarchy to fine grid
     do l = lmax-1, 0, -1
+       write(lvl_name, '(I0)') l
+       call profiler_start_region( "AMGe_level_" // trim(lvl_name))
        associate( lvl => this%lvl(l), lc => this%lvl(l+1) )
          call amge_prolong(this%lvl, l, lc%x, lvl%r) !r as a tmp workspace
          call amge_axpy(1.0_rp, lvl%r, lvl%x) !r as a tmp workspace
          call amge_smooth_l1(lvl, lvl%dl1, lvl%x, lvl%b, lvl%sm_itr)
        end associate
+       call profiler_end_region( "AMGe_level_" // trim(lvl_name))
     end do
   end subroutine amge_flat_vcycle
 
