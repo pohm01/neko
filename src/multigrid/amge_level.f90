@@ -62,6 +62,7 @@ module amge_level
      real(rp), allocatable :: mult(:) !< multiplicity of dof !TODO: this duplicates winv in tr (but after gather)
      !! Smoother info
      real(kind=rp), allocatable :: dl1(:) !< Storage for l1 diagonal (Assembled?)
+     integer :: sm_itr !< Smoother iterations on level
    contains
      procedure, pass(this) :: data_init => amge_level_data_init
      procedure, pass(this) :: free => amge_level_free
@@ -78,11 +79,13 @@ contains
   !! Needs mmsh to already be filled
   !! Needs elm_vtx_ptr elm_vtx_idx to already be filled
   !! Needs AM to already be filled
-  subroutine amge_level_data_init(this, level)
+  subroutine amge_level_data_init(this, level, sm_itr)
     class(amge_level_t), intent(inout) :: this
     integer, intent(in) :: level
+    integer, intent(in) :: sm_itr
     logical, allocatable :: shared_vtx(:)
     this%level = level
+    this%sm_itr = sm_itr
     if (this%topo_done) then
        ! Initialize gsh on level. shared_vtx is only seeded on level 0 once
        ! amge_mesh_set_shared_from_dofmap is wired into the hierarchy build;

@@ -193,7 +193,7 @@ contains
   ! ================== hierarchy ==================
 
   !> Initialize a macroelement amg hierarchy from a neko mesh_t
-  subroutine amge_hierarchy_init(this, ax, Xh, coef, msh, blst, nlvls)
+  subroutine amge_hierarchy_init(this, ax, Xh, coef, msh, blst, nlvls, sm_itr)
     class(amge_hierarchy_t), intent(inout) :: this
     class(ax_t), intent(inout) :: ax
     type(coef_t), intent(inout) :: coef
@@ -201,6 +201,7 @@ contains
     type(mesh_t), target, intent(inout) :: msh
     type(bc_list_t), target, intent(inout) :: blst
     integer, intent(in) :: nlvls
+    integer, intent(in) :: sm_itr
     type(macro_topology_t) :: topo
     integer, allocatable :: part(:)
     integer :: l, nm, glb_min_elm, ierr
@@ -214,7 +215,7 @@ contains
          this%lvl(0)%elm_vtx_idx, coef%dof, &
          this%lvl(0)%mmsh%shared_vtx)
     call amge_fill_AM_from_ax(this%lvl(0), ax, coef, Xh, msh, blst)
-    call this%lvl(0)%data_init(0)
+    call this%lvl(0)%data_init(0, sm_itr)
     call check_spsd(this%lvl(0))
 
     ! Build the rest of the hierarchy
@@ -230,7 +231,7 @@ contains
        call coarsen_level_3d(this%lvl(l-1), part, nm, topo, this%lvl(l), &
                              use_ghost=.true.)
        call check_invariants(topo)
-       call this%lvl(l)%data_init(l)
+       call this%lvl(l)%data_init(l, sm_itr)
        write(*, '("   [check] rank ", I0, ": level ", I0, "->", I0, " elms: ", I0, " -> ", I0, &
             & " dofs: ", I0, " -> ", I0)') &
          pe_rank, (l-1), l, this%lvl(l-1)%nelm(), this%lvl(l)%nelm(), &
@@ -298,12 +299,12 @@ contains
   !> V-cycle on hierarchy, non-recursive version
   subroutine amge_flat_vcycle(this)
     class(amge_hierarchy_t), intent(inout) :: this
-    integer :: l, lmax
+    integer :: l, lmax, si
     lmax = this%nlvls-1
     ! Traverse down hierarchy to coarse grid
     do l = 0, lmax-1
        associate( lvl => this%lvl(l), lc => this%lvl(l+1) )
-         call amge_smooth_l1(lvl, lvl%dl1, lvl%x, lvl%b, 1)
+         call amge_smooth_l1(lvl, lvl%dl1, lvl%x, lvl%b, lvl%sm_itr)
          call calc_resid(lvl, lvl%r, lvl%x, lvl%b)
          call amge_restrict(this%lvl, l, lvl%r, lc%b)
          ! Assemble the per-macroelement contributions
@@ -313,14 +314,14 @@ contains
     end do
     ! Coarse grid solve
     associate( lvl => this%lvl(lmax) )
-      call amge_smooth_l1(lvl, lvl%dl1, lvl%x, lvl%b, 1)
+      call amge_smooth_l1(lvl, lvl%dl1, lvl%x, lvl%b, lvl%sm_itr)
     end associate
     ! Traverse up hierarchy to fine grid
     do l = lmax-1, 0, -1
        associate( lvl => this%lvl(l), lc => this%lvl(l+1) )
          call amge_prolong(this%lvl, l, lc%x, lvl%r) !r as a tmp workspace
          call amge_axpy(1.0_rp, lvl%r, lvl%x) !r as a tmp workspace
-         call amge_smooth_l1(lvl, lvl%dl1, lvl%x, lvl%b, 1)
+         call amge_smooth_l1(lvl, lvl%dl1, lvl%x, lvl%b, lvl%sm_itr)
        end associate
     end do
   end subroutine amge_flat_vcycle
