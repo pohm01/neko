@@ -14,13 +14,14 @@ module amge
   use amge_coarsen, only : coarsen_level_3d, agglomerate_level
   use amge_level, only : amge_level_t, amge_vec_t, amge_level_transfer_t, &
        amge_apply
-  use amge_utils, only : amge_axpy, scale_by_valence, &
+  use amge_utils, only : amge_axpy, &
        amge_gather, amge_scatter_add, amge_gs_placeholder, &
        assemble_dense, build_p_dense, check_transition, check_invariants, &
        check_spsd, check_constant_reproduction, &
        amge_fill_AM_from_ax, q1_hex
   use amge_gs, only : amge_mesh_set_shared_from_dofmap
-  use amge_smoother, only : amge_cheby_t
+  use amge_smoother, only : amge_smoother_wrapper_t, amge_smoother_alloc, &
+       AMGE_SMOOTHER_CHEBY
   use profiler, only : profiler_start_region, profiler_end_region
   implicit none
   private
@@ -29,7 +30,10 @@ module amge
   type, public :: amge_hierarchy_t
     integer :: nlvls = 2 !< number of levels in the hierarchy
     type(amge_level_t), allocatable :: lvl(:) !< amg levels in the hierarchy
-    type(amge_cheby_t), allocatable :: smoo(:) !< Chebyshev smoother per level
+    !> Smoother per level (a heterogeneous, per-level choice of concrete
+    !! type -- see amge_smoother.f90's amge_smoother_wrapper_t for why
+    !! this needs a wrapper rather than a plain polymorphic array).
+    type(amge_smoother_wrapper_t), allocatable :: smoo(:)
     integer :: target_agg_size = 8 !< target agg size
     integer :: min_grid_elm = 1 !< minimum elements on coarse grid
   contains
@@ -147,68 +151,11 @@ contains
     end associate
   end subroutine amge_restrict_ua
 
-  ! ================== smoother ==================
-
-  !> Literal l1-Jacobi sweep in cell-wise storage
-  !! Works on assembled rhs
-  subroutine amge_smooth_l1(lvl, dl1, u, bt, nu)
-    type(amge_level_t), intent(inout) :: lvl
-    real(rp), intent(in) :: dl1(:)            !< assembled l1 diagonal
-    type(amge_vec_t), intent(inout) :: u      !< primal iterate (continuous)
-    type(amge_vec_t), intent(in) :: bt        !< assembled cell-wise rhs
-    integer(i4), intent(in) :: nu
-    type(amge_vec_t) :: rt
-    integer(i4) :: it, e, p, off
-    call lvl%new_vec(rt)
-    do it = 1, nu
-       call amge_apply(lvl, u, rt)
-       call lvl%gsh%op(rt%x)
-       rt%x = bt%x - rt%x
-       do e = 1, lvl%nelm()
-          off = lvl%elm_vtx_ptr(e)
-          do p = 1, lvl%ndof_el(e)
-             if (abs(dl1(lvl%elm_vtx_idx(off + p))) > 0) then
-                u%x(off + p) = u%x(off + p) + rt%x(off+p) / dl1(lvl%elm_vtx_idx(off + p))
-             end if
-          end do
-       end do
-       call lvl%gsh%op(u%x)
-       call scale_by_valence(lvl, u)
-    end do
-    call rt%free()
-  end subroutine amge_smooth_l1
-
-  !> Literal l1-Jacobi sweep in cell-wise storage (admissible form
-  !! P = G D^{-1} G^T): for each sweep, form the cell-local dual residual
-  !! b~ - A u, assemble it (the one GS), scale by the assembled l1
-  !! diagonal, and gather the continuous correction back into the copies.
-  subroutine melm_smooth_l1_ua(lvl, dl1, u, bt, nu)
-    type(amge_level_t), intent(inout) :: lvl
-    real(rp), intent(in) :: dl1(:)            !< assembled l1 diagonal
-    type(amge_vec_t), intent(inout) :: u      !< primal iterate (continuous)
-    type(amge_vec_t), intent(in) :: bt        !< unassembled dual rhs
-    integer(i4), intent(in) :: nu
-    type(amge_vec_t) :: rt
-    integer(i4) :: it, e, p, off
-    call lvl%new_vec(rt)
-    do it = 1, nu
-       call amge_apply(lvl, u, rt)
-       rt%x = bt%x - rt%x !< NOTE RHS(bt) is unassembled.
-       call lvl%gsh%op(rt%x)
-       do e = 1, lvl%nelm()
-          off = lvl%elm_vtx_ptr(e)
-          do p = 1, lvl%ndof_el(e)
-             u%x(off + p) = u%x(off + p) + rt%x(off+p) / dl1(lvl%elm_vtx_idx(off + p))
-          end do
-       end do
-    end do
-    call rt%free()
-  end subroutine melm_smooth_l1_ua
-
   ! ================== hierarchy ==================
 
   !> Initialize a macroelement amg hierarchy from a neko mesh_t
-  subroutine amge_hierarchy_init(this, ax, Xh, coef, msh, blst, nlvls, sm_itr)
+  subroutine amge_hierarchy_init(this, ax, Xh, coef, msh, blst, nlvls, sm_itr, &
+       smoother_kind)
     class(amge_hierarchy_t), intent(inout) :: this
     class(ax_t), intent(inout) :: ax
     type(coef_t), intent(inout) :: coef
@@ -217,6 +164,10 @@ contains
     type(bc_list_t), target, intent(inout) :: blst
     integer, intent(in) :: nlvls
     integer, intent(in) :: sm_itr
+    !> Per-level smoother choice (AMGE_SMOOTHER_CHEBY/AMGE_SMOOTHER_JACOBI
+    !! from amge_smoother.f90), indexed 0:nlvls-1. Defaults to Chebyshev
+    !! on every level when not given.
+    integer, intent(in), optional :: smoother_kind(0:)
     type(macro_topology_t) :: topo
     integer, allocatable :: part(:)
     integer :: l, nm, glb_min_elm, ierr
@@ -271,11 +222,16 @@ contains
        !this%lvl = this%lvl(0:l)
     end if
 
-    ! Initialize the Chebyshev smoother on every level now that nlvls is
-    ! final (an early exit above can shrink it from what was requested)
+    ! Initialize the smoother on every level now that nlvls is final (an
+    ! early exit above can shrink it from what was requested)
     allocate(this%smoo(0:this%nlvls-1))
     do l = 0, this%nlvls-1
-       call this%smoo(l)%init(this%lvl(l), l, sm_itr)
+       if (present(smoother_kind)) then
+          call amge_smoother_alloc(this%smoo(l)%obj, smoother_kind(l))
+       else
+          call amge_smoother_alloc(this%smoo(l)%obj, AMGE_SMOOTHER_CHEBY)
+       end if
+       call this%smoo(l)%obj%init(this%lvl(l), l, sm_itr)
     end do
   end subroutine amge_hierarchy_init
 
@@ -329,7 +285,7 @@ contains
        write(lvl_name, '(I0)') l
        call profiler_start_region( "AMGe_level_" // trim(lvl_name))
        associate( lvl => this%lvl(l), lc => this%lvl(l+1) )
-         call this%smoo(l)%solve(lvl, lvl%x, lvl%b, zero_init=.true.)
+         call this%smoo(l)%obj%solve(lvl, lvl%x, lvl%b, zero_init=.true.)
          call calc_resid(lvl, lvl%r, lvl%x, lvl%b)
          call amge_restrict(this%lvl, l, lvl%r, lc%b)
          ! Assemble the per-macroelement contributions
@@ -342,7 +298,7 @@ contains
     write(lvl_name, '(I0)') lmax
     call profiler_start_region( "AMGe_level_" // trim(lvl_name))
     associate( lvl => this%lvl(lmax) )
-      call this%smoo(lmax)%solve(lvl, lvl%x, lvl%b, zero_init=.true.)
+      call this%smoo(lmax)%obj%solve(lvl, lvl%x, lvl%b, zero_init=.true.)
     end associate
     call profiler_end_region( "AMGe_level_" // trim(lvl_name))
     ! Traverse up hierarchy to fine grid
@@ -352,7 +308,7 @@ contains
        associate( lvl => this%lvl(l), lc => this%lvl(l+1) )
          call amge_prolong(this%lvl, l, lc%x, lvl%r) !r as a tmp workspace
          call amge_axpy(1.0_rp, lvl%r, lvl%x) !r as a tmp workspace
-         call this%smoo(l)%solve(lvl, lvl%x, lvl%b)
+         call this%smoo(l)%obj%solve(lvl, lvl%x, lvl%b)
        end associate
        call profiler_end_region( "AMGe_level_" // trim(lvl_name))
     end do
