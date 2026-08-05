@@ -3,7 +3,7 @@ module amge
   use comm
   use mpi_f08, only: MPI_Allreduce, MPI_MIN, MPI_IN_PLACE, MPI_INTEGER, MPI_Barrier
   use utils, only : neko_error
-  use math, only : copy, col2, rzero, add2s1
+  use math, only : copy, col2, rzero, add2s1, glsc3
   use mesh, only : mesh_t
   use space, only : space_t
   use coefs, only : coef_t
@@ -12,13 +12,15 @@ module amge
   use matrix, only : matrix_t
   use amge_topology, only : macro_topology_t, macro_mesh_t, macro_mesh_init_hex
   use amge_coarsen, only : coarsen_level_3d, agglomerate_level
-  use amge_level, only : amge_level_t, amge_vec_t, amge_level_transfer_t
+  use amge_level, only : amge_level_t, amge_vec_t, amge_level_transfer_t, &
+       amge_apply
   use amge_utils, only : amge_axpy, scale_by_valence, &
        amge_gather, amge_scatter_add, amge_gs_placeholder, &
        assemble_dense, build_p_dense, check_transition, check_invariants, &
        check_spsd, check_constant_reproduction, &
        amge_fill_AM_from_ax, q1_hex
   use amge_gs, only : amge_mesh_set_shared_from_dofmap
+  use amge_smoother, only : amge_cheby_t
   use profiler, only : profiler_start_region, profiler_end_region
   implicit none
   private
@@ -27,6 +29,7 @@ module amge
   type, public :: amge_hierarchy_t
     integer :: nlvls = 2 !< number of levels in the hierarchy
     type(amge_level_t), allocatable :: lvl(:) !< amg levels in the hierarchy
+    type(amge_cheby_t), allocatable :: smoo(:) !< Chebyshev smoother per level
     integer :: target_agg_size = 8 !< target agg size
     integer :: min_grid_elm = 1 !< minimum elements on coarse grid
   contains
@@ -41,22 +44,6 @@ module amge
   end type amge_solver_t
 
 contains
-
-  ! ================== matrix operator ==================
-
-  !> Cell-local operator: primal in, UNASSEMBLED dual out. Each element
-  !! applies its own local matrix to its own copies; no scatter.
-  subroutine amge_apply(lvl, xin, yout)
-    type(amge_level_t), intent(in) :: lvl
-    type(amge_vec_t), intent(in) :: xin
-    type(amge_vec_t), intent(inout) :: yout
-    integer(i4) :: e, off, n
-    do e = 1, lvl%nelm()
-       off = lvl%elm_vtx_ptr(e)
-       n = lvl%ndof_el(e)
-       yout%x(off + 1 : off + n) = matmul(lvl%AM(e)%x, xin%x(off + 1 : off + n))
-    end do
-  end subroutine amge_apply
 
   ! ================== grid transfers ==================
 
@@ -283,6 +270,13 @@ contains
        !TODO: reduce allocation size of this%lvl
        !this%lvl = this%lvl(0:l)
     end if
+
+    ! Initialize the Chebyshev smoother on every level now that nlvls is
+    ! final (an early exit above can shrink it from what was requested)
+    allocate(this%smoo(0:this%nlvls-1))
+    do l = 0, this%nlvls-1
+       call this%smoo(l)%init(this%lvl(l), l, sm_itr)
+    end do
   end subroutine amge_hierarchy_init
 
   !> Initialize a macroelement amg level from a neko mesh_t
@@ -335,7 +329,7 @@ contains
        write(lvl_name, '(I0)') l
        call profiler_start_region( "AMGe_level_" // trim(lvl_name))
        associate( lvl => this%lvl(l), lc => this%lvl(l+1) )
-         call amge_smooth_l1(lvl, lvl%dl1, lvl%x, lvl%b, lvl%sm_itr)
+         call this%smoo(l)%solve(lvl, lvl%x, lvl%b, zero_init=.true.)
          call calc_resid(lvl, lvl%r, lvl%x, lvl%b)
          call amge_restrict(this%lvl, l, lvl%r, lc%b)
          ! Assemble the per-macroelement contributions
@@ -348,7 +342,7 @@ contains
     write(lvl_name, '(I0)') lmax
     call profiler_start_region( "AMGe_level_" // trim(lvl_name))
     associate( lvl => this%lvl(lmax) )
-      call amge_smooth_l1(lvl, lvl%dl1, lvl%x, lvl%b, lvl%sm_itr)
+      call this%smoo(lmax)%solve(lvl, lvl%x, lvl%b, zero_init=.true.)
     end associate
     call profiler_end_region( "AMGe_level_" // trim(lvl_name))
     ! Traverse up hierarchy to fine grid
@@ -358,7 +352,7 @@ contains
        associate( lvl => this%lvl(l), lc => this%lvl(l+1) )
          call amge_prolong(this%lvl, l, lc%x, lvl%r) !r as a tmp workspace
          call amge_axpy(1.0_rp, lvl%r, lvl%x) !r as a tmp workspace
-         call amge_smooth_l1(lvl, lvl%dl1, lvl%x, lvl%b, lvl%sm_itr)
+         call this%smoo(l)%solve(lvl, lvl%x, lvl%b)
        end associate
        call profiler_end_region( "AMGe_level_" // trim(lvl_name))
     end do
@@ -373,10 +367,27 @@ contains
     integer, intent(in) :: n
     real(kind=rp), dimension(n), intent(inout) :: z
     real(kind=rp), dimension(n), intent(inout) :: r
-    call copy(this%amg%lvl(0)%b%x, r, n) ! Need to convert to cell-local RHS
-    call rzero(this%amg%lvl(0)%x%x, n)
-    call this%amg%vcycle()
-    call copy(z, this%amg%lvl(0)%x%x, n)
+    real(kind=rp) :: rnorm_pre, rnorm_post
+    associate( lvl0 => this%amg%lvl(0) )
+      call copy(lvl0%b%x, r, n) ! Need to convert to cell-local RHS
+      call rzero(lvl0%x%x, n)
+
+      ! weighted by lvl0%mult (1/duplication count), same convention as
+      ! every other global reduction in AMGe (e.g. amge_cheby_power),
+      ! since lvl0%b%x is cell-wise (duplicated) storage
+      rnorm_pre = sqrt(glsc3(lvl0%b%x, lvl0%mult, lvl0%b%x, n))
+
+      call this%amg%vcycle()
+
+      ! true residual of the correction just computed, b - A*z
+      call calc_resid(lvl0, lvl0%r, lvl0%x, lvl0%b)
+      rnorm_post = sqrt(glsc3(lvl0%r%x, lvl0%mult, lvl0%r%x, n))
+
+      write(*, '("   [check] rank ", I0, ": AMGe vcycle residual: before = ", &
+           & ES12.5, "  after = ", ES12.5)') pe_rank, rnorm_pre, rnorm_post
+
+      call copy(z, lvl0%x%x, n)
+    end associate
   end subroutine amge_solve
 
   ! ================== math operations ==================

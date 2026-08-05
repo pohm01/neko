@@ -7,6 +7,8 @@ module amge_level
   implicit none
   private
 
+  public :: amge_apply
+
   !> Cell-wise (macroelement-local, duplicated) vector. x(:) is indexed
   !! by the owning level's elm_vtx_ptr: element e occupies
   !! x(elm_vtx_ptr(e)+1 : elm_vtx_ptr(e+1)), and position p within that
@@ -144,6 +146,23 @@ contains
     allocate(v%x(v%n_dofs))
     v%x = 0.0_rp
   end subroutine amge_level_new_vec
+
+  !> Cell-local operator: primal in, UNASSEMBLED dual out. Each element
+  !! applies its own local matrix to its own copies; no scatter. Callers
+  !! that need the true assembled action (a well-defined matvec) must
+  !! follow this with a gather-scatter, e.g. amge_cheby_matvec in
+  !! amge_smoother.f90.
+  subroutine amge_apply(lvl, xin, yout)
+    type(amge_level_t), intent(in) :: lvl
+    type(amge_vec_t), intent(in) :: xin
+    type(amge_vec_t), intent(inout) :: yout
+    integer(i4) :: e, off, n
+    do e = 1, lvl%nelm()
+       off = lvl%elm_vtx_ptr(e)
+       n = lvl%ndof_el(e)
+       yout%x(off + 1 : off + n) = matmul(lvl%AM(e)%x, xin%x(off + 1 : off + n))
+    end do
+  end subroutine amge_apply
 
   !> Valence (duplication count) per unique dof: diag(G^T G). v = 1 ; gs ;
   !! mult = 1/v -- gsh%op already sums every copy of a dof, same-rank AND
