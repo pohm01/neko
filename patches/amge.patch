@@ -1,0 +1,275 @@
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 41df4edd..33933550 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -144,6 +144,14 @@ neko_fortran_SOURCES = \
+ 	math/matrix.f90\
+ 	math/matrix_math.f90\
+ 	math/signed_distance.f90\
++	multigrid/amge_ghost.f90\
++	multigrid/amge_gs.f90\
++	multigrid/amge_topology.f90\
++	multigrid/amge_level.f90\
++	multigrid/amge_coarsen.f90\
++	multigrid/amge_utils.f90\
++	multigrid/amge_smoother.f90\
++	multigrid/amge.f90\
+ 	multigrid/tree_amg.f90\
+ 	multigrid/tree_amg_utils.f90\
+ 	multigrid/tree_amg_aggregate.f90\
+diff --git a/src/gs/gather_scatter.f90 b/src/gs/gather_scatter.f90
+index 6ad71b1d..81733dff 100644
+--- a/src/gs/gather_scatter.f90
++++ b/src/gs/gather_scatter.f90
+@@ -127,6 +127,11 @@ module gather_scatter
+   public :: GS_COMM_MPI, GS_COMM_MPIGPU, GS_COMM_NCCL, GS_COMM_NVSHMEM, &
+        GS_COMM_OPENSHMEM, GS_COMM_CAF, GS_COMM_NEIGHBOUR, GS_COMM_UTOFU
+ 
++  ! Reusable building blocks for callers that build their own local/shared
++  ! gs mapping without a dofmap (e.g. amge_gs, whose AMGe levels have no
++  ! tensor-product geometry for gs_init_mapping to walk).
++  public :: gs_comm_alloc_init, gs_schedule
++
+ contains
+ 
+   !> Initialize a gather-scatter kernel
+@@ -224,37 +229,7 @@ contains
+        end if
+     end if
+ 
+-    select case (comm_bcknd_)
+-    case (GS_COMM_MPI)
+-       call neko_log%message('Comm         :          MPI')
+-       allocate(gs_mpi_t::gs%comm)
+-    case (GS_COMM_MPIGPU)
+-       call neko_log%message('Comm         :   Device MPI')
+-       allocate(gs_device_mpi_t::gs%comm)
+-    case (GS_COMM_NCCL)
+-       call neko_log%message('Comm         :         NCCL')
+-       allocate(gs_device_nccl_t::gs%comm)
+-    case (GS_COMM_NVSHMEM)
+-       call neko_log%message('Comm         :      NVSHMEM')
+-       allocate(gs_device_shmem_t::gs%comm)
+-    case (GS_COMM_OPENSHMEM)
+-       call neko_log%message('Comm         :    OpenSHMEM')
+-       allocate(gs_shmem_t::gs%comm)
+-    case (GS_COMM_CAF)
+-       call neko_log%message('Comm         :          CAF')
+-       allocate(gs_caf_t::gs%comm)
+-    case (GS_COMM_NEIGHBOUR)
+-       call neko_log%message('Comm         :   MPI neigh.')
+-       allocate(gs_neighbour_t::gs%comm)
+-    case (GS_COMM_UTOFU)
+-       call neko_log%message('Comm         :        uTofu')
+-       allocate(gs_utofu_t::gs%comm)
+-    case default
+-       call neko_error('Unknown Gather-scatter comm. backend')
+-    end select
+-    ! Initialize a stack for each rank containing which dofs to send/recv at
+-    ! that rank
+-    call gs%comm%init_dofs()
++    call gs_comm_alloc_init(gs%comm, comm_bcknd_)
+     ! Initialize mapping between local ids and gather-scatter ids
+     ! based on the global numbering in dofmap
+     call gs_init_mapping(gs)
+@@ -509,6 +484,48 @@ contains
+ 
+   end subroutine gs_free
+ 
++  !> Allocate a concrete gather-scatter comm backend for @a comm_bcknd and
++  !! initialize its per-rank dof stacks. Factored out of gs_init's comm
++  !! selection so that callers with no dofmap (e.g. amge_gs_map_init_comm)
++  !! can obtain the same comm backend without going through gs_init_mapping.
++  subroutine gs_comm_alloc_init(comm, comm_bcknd)
++    class(gs_comm_t), allocatable, intent(inout) :: comm
++    integer, intent(in) :: comm_bcknd
++
++    select case (comm_bcknd)
++    case (GS_COMM_MPI)
++       call neko_log%message('Comm         :          MPI')
++       allocate(gs_mpi_t::comm)
++    case (GS_COMM_MPIGPU)
++       call neko_log%message('Comm         :   Device MPI')
++       allocate(gs_device_mpi_t::comm)
++    case (GS_COMM_NCCL)
++       call neko_log%message('Comm         :         NCCL')
++       allocate(gs_device_nccl_t::comm)
++    case (GS_COMM_NVSHMEM)
++       call neko_log%message('Comm         :      NVSHMEM')
++       allocate(gs_device_shmem_t::comm)
++    case (GS_COMM_OPENSHMEM)
++       call neko_log%message('Comm         :    OpenSHMEM')
++       allocate(gs_shmem_t::comm)
++    case (GS_COMM_CAF)
++       call neko_log%message('Comm         :          CAF')
++       allocate(gs_caf_t::comm)
++    case (GS_COMM_NEIGHBOUR)
++       call neko_log%message('Comm         :   MPI neigh.')
++       allocate(gs_neighbour_t::comm)
++    case (GS_COMM_UTOFU)
++       call neko_log%message('Comm         :        uTofu')
++       allocate(gs_utofu_t::comm)
++    case default
++       call neko_error('Unknown Gather-scatter comm. backend')
++    end select
++
++    ! Initialize a stack for each rank containing which dofs to send/recv at
++    ! that rank
++    call comm%init_dofs()
++  end subroutine gs_comm_alloc_init
++
+   !> Setup mapping of dofs to gather-scatter operations
+   subroutine gs_init_mapping(gs)
+     type(gs_t), target, intent(inout) :: gs
+diff --git a/src/multigrid/amge.f90 b/src/multigrid/amge.f90
+index ca6a7e33..0f6c473e 100644
+--- a/src/multigrid/amge.f90
++++ b/src/multigrid/amge.f90
+@@ -34,7 +34,7 @@ module amge
+     !! type -- see amge_smoother.f90's amge_smoother_wrapper_t for why
+     !! this needs a wrapper rather than a plain polymorphic array).
+     type(amge_smoother_wrapper_t), allocatable :: smoo(:)
+-    integer :: target_agg_size = 8 !< target agg size
++    integer :: target_agg_size = 4 !< target agg size
+     integer :: min_grid_elm = 1 !< minimum elements on coarse grid
+   contains
+     procedure, pass(this) :: init => amge_hierarchy_init
+@@ -285,7 +285,8 @@ contains
+        write(lvl_name, '(I0)') l
+        call profiler_start_region( "AMGe_level_" // trim(lvl_name))
+        associate( lvl => this%lvl(l), lc => this%lvl(l+1) )
+-         call this%smoo(l)%obj%solve(lvl, lvl%x, lvl%b, zero_init=.true.)
++         !call this%smoo(l)%obj%solve(lvl, lvl%x, lvl%b, zero_init=.true.)
++         call this%smoo(l)%obj%solve(lvl, lvl%x, lvl%b)
+          call calc_resid(lvl, lvl%r, lvl%x, lvl%b)
+          call amge_restrict(this%lvl, l, lvl%r, lc%b)
+          ! Assemble the per-macroelement contributions
+@@ -324,23 +325,22 @@ contains
+     real(kind=rp), dimension(n), intent(inout) :: z
+     real(kind=rp), dimension(n), intent(inout) :: r
+     real(kind=rp) :: rnorm_pre, rnorm_post
++    integer :: i
+     associate( lvl0 => this%amg%lvl(0) )
+       call copy(lvl0%b%x, r, n) ! Need to convert to cell-local RHS
+       call rzero(lvl0%x%x, n)
+ 
+-      ! weighted by lvl0%mult (1/duplication count), same convention as
+-      ! every other global reduction in AMGe (e.g. amge_cheby_power),
+-      ! since lvl0%b%x is cell-wise (duplicated) storage
++      !!do i = 1, 5
+       rnorm_pre = sqrt(glsc3(lvl0%b%x, lvl0%mult, lvl0%b%x, n))
+ 
+       call this%amg%vcycle()
+ 
+-      ! true residual of the correction just computed, b - A*z
+       call calc_resid(lvl0, lvl0%r, lvl0%x, lvl0%b)
+       rnorm_post = sqrt(glsc3(lvl0%r%x, lvl0%mult, lvl0%r%x, n))
+ 
+       write(*, '("   [check] rank ", I0, ": AMGe vcycle residual: before = ", &
+            & ES12.5, "  after = ", ES12.5)') pe_rank, rnorm_pre, rnorm_post
++      !!end do
+ 
+       call copy(z, lvl0%x%x, n)
+     end associate
+diff --git a/src/multigrid/phmg.f90 b/src/multigrid/phmg.f90
+index e55cfeb8..5c07f331 100644
+--- a/src/multigrid/phmg.f90
++++ b/src/multigrid/phmg.f90
+@@ -51,6 +51,7 @@ module phmg
+   use schwarz, only : schwarz_t
+   use ax_product, only : ax_t, ax_helm_factory
+   use tree_amg_multigrid, only : tamg_solver_t
++  use amge, only : amge_solver_t
+   use interpolation, only : interpolator_t
+   use json_module, only : json_file
+   use json_utils, only : json_get_or_default, json_get
+@@ -93,6 +94,7 @@ module phmg
+ 
+   type, public, extends(pc_t) :: phmg_t
+      type(tamg_solver_t) :: amg_solver
++     type(amge_solver_t) :: amge_solver
+      integer :: nlvls
+      type(phmg_hrchy_t) :: phmg_hrchy
+      class(ax_t), allocatable :: ax
+@@ -108,6 +110,7 @@ module phmg
+      procedure, private, pass(this) :: mg_cycle => phmg_mg_cycle
+   end type phmg_t
+ 
++  logical :: use_amge = .false.
+ contains
+ 
+   subroutine phmg_init(this, coef, bclst, phmg_params)
+@@ -291,12 +294,20 @@ contains
+             this%phmg_hrchy%lvl(i)%Xh)
+     end do
+ 
++    if (crs_tamg_lvls > 0) then
+     call this%amg_solver%init(this%ax, this%phmg_hrchy%lvl(this%nlvls -1)%Xh, &
+          this%phmg_hrchy%lvl(this%nlvls -1)%coef, this%msh, &
+          this%phmg_hrchy%lvl(this%nlvls-1)%gs_h, crs_tamg_lvls, &
+          this%phmg_hrchy%lvl(this%nlvls -1)%bclst, &
+          crs_tamg_itrs, crs_tamg_cheby_degree)
+ 
++    else
++    use_amge = .true.
++    associate( lc => this%phmg_hrchy%lvl(this%nlvls-1) )
++      call this%amge_solver%amg%init(this%ax, lc%Xh, lc%coef, this%msh, lc%bclst, &
++           -crs_tamg_lvls, crs_tamg_cheby_degree)
++    end associate
++    end if
+   end subroutine phmg_init_from_components
+ 
+   subroutine phmg_free(this)
+@@ -511,9 +522,15 @@ contains
+       !------------!
+       !   SOLVE    !
+       !------------!
++      if(use_amge)then
++      call this%amge_solver%solve(mg(this%nlvls-1)%z%x, &
++           mg(this%nlvls-1)%r%x, &
++           mg(this%nlvls-1)%dm_Xh%size())
++      else
+       call this%amg_solver%solve(mg(this%nlvls-1)%z%x, &
+            mg(this%nlvls-1)%r%x, &
+            mg(this%nlvls-1)%dm_Xh%size())
++      end if
+       call profiler_end_region( 'PHMG_coarse-solve' )
+ 
+       do lvl = (this%nlvls-2), 0, -1
+diff --git a/src/multigrid/tree_amg_multigrid.f90 b/src/multigrid/tree_amg_multigrid.f90
+index 1b6a396a..ba0fb3a8 100644
+--- a/src/multigrid/tree_amg_multigrid.f90
++++ b/src/multigrid/tree_amg_multigrid.f90
+@@ -44,7 +44,7 @@
+ module tree_amg_multigrid
+   use num_types, only: rp
+   use utils, only : neko_error, neko_warning
+-  use math, only : add2, rzero, glsc2, col2, copy, add2s1
++  use math, only : add2, rzero, glsc3, glsc2, col2, copy, add2s1
+   use device_math, only : device_rzero, device_col2, device_add2, device_sub3, &
+        device_glsc2, device_copy
+   use comm
+@@ -274,6 +274,7 @@ contains
+     type(c_ptr) :: r_d
+     integer :: iter, max_iter, i
+     logical :: zero_initial_guess
++    real(kind=rp) :: rnorm_pre, rnorm_post
+ 
+     max_iter = this%max_iter
+ 
+@@ -305,10 +306,15 @@ contains
+        end do
+        !$omp end parallel do
+        zero_initial_guess = .true.
++       rnorm_pre = sqrt(glsc3(this%wrk(0)%b, this%amg%coef%mult, this%wrk(0)%b, n))
+        ! Call the amg cycle
+        do iter = 1, max_iter
+           call this%mg_cycle(zero_initial_guess)
+           zero_initial_guess = .false.
++          call calc_resid(this%wrk(0)%r, this%wrk(0)%x, this%wrk(0)%b, this%amg, 0, n)
++          rnorm_post = sqrt(glsc3(this%wrk(0)%r, this%amg%coef%mult, this%wrk(0)%r, n))
++          write(*, '("   [check] rank ", I0, ": mf-AMG vcycle residual: before = ", &
++               & ES12.5, "  after = ", ES12.5)') pe_rank, rnorm_pre, rnorm_post
+        end do
+        call copy(z, this%wrk(0)%x, n)
+     end if
