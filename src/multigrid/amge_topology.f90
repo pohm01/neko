@@ -82,7 +82,7 @@ module amge_topology
   implicit none
   private
   public :: macro_mesh_init_hex, macro_topology_build_next_level_owned, &
-       macro_mesh_elem_face_csr, macro_mesh_splice_ghost
+       macro_mesh_elem_face_csr, macro_mesh_splice_ghost, derive_elm_loc_face
 
   !> A macroedge: an open or closed chain of vertices (local indices);
   !! chain(1) == chain(size(chain)) marks a closed loop (breakpoint at
@@ -115,6 +115,13 @@ module amge_topology
      integer(i4), allocatable :: edge_vtx(:,:)    !< (2, n_edge)
      integer(i4), allocatable :: face_el(:,:)     !< (2, n_face) incident elems
      integer(i4), allocatable :: face_nel(:)      !< 1 or 2
+     !> (6, n_elem) global face id per local face slot, in fixed loc_face
+     !! order (1,2=-x/+x, 3,4=-y/+y, 5,6=-z/+z). Only populated by
+     !! macro_mesh_init_hex (level 0, true hexes with a fixed reference
+     !! template); left unallocated by build_next_level[_owned] (coarser
+     !! levels, whose macroelements have no such template) -- callers use
+     !! allocated() on this field to detect which case they have.
+     integer(i4), allocatable :: elm_loc_face(:,:)
      integer(i4), allocatable :: vert_id(:)       !< local -> global vertex id
      !> Is this vertex shared with another MPI rank? Inherited from the
      !! finest-level (Q1) dofmap%shared_dof and propagated by
@@ -229,6 +236,7 @@ contains
     allocate(mmsh%face_vtx_ptr(6 * nelv + 1), mmsh%face_vtx_idx(4 * 6 * nelv))
     allocate(mmsh%face_edge_ptr(6 * nelv + 1), mmsh%face_edge_idx(4 * 6 * nelv))
     allocate(mmsh%face_el(2, 6 * nelv), mmsh%face_nel(6 * nelv))
+    allocate(mmsh%elm_loc_face(6, nelv))
     allocate(mmsh%vert_id(8 * nelv))
     mmsh%face_nel = 0
     nv = 0; ne = 0; nf = 0
@@ -278,6 +286,7 @@ contains
           if (mmsh%face_nel(f) .gt. 2) &
                call neko_error('macro_topology: facet with > 2 elements')
           mmsh%face_el(mmsh%face_nel(f), f) = e
+          mmsh%elm_loc_face(t, e) = f
        end do
     end do
     mmsh%n_verts = nv
@@ -984,6 +993,120 @@ contains
     end do
   end subroutine macro_mesh_elem_face_csr
 
+  !> Brick-recursion eligibility + local-slot derivation for a level's own
+  !! mesh (fine or coarse): an element qualifies only if it has exactly 6
+  !! incident faces, each bounded by exactly 4 macroedges, and those 6
+  !! faces partition into 3 pairs sharing no vertex at all.
+  !!
+  !! The 4-macroedge check (via face_edge_ptr, i.e. size(mface%bnd_medge))
+  !! is the "clean rectangle, not an L-shape" test -- NOT a vertex count:
+  !! macro_face_t%verts is the union of every vertex of every constituent
+  !! facet in the patch (see how mf%verts is filled just above, around
+  !! "cnt = 0; do a = 1, size(mf%facet_ids)..."), so even a clean 2x2
+  !! macroface already has 9 vertices (4 corners + 4 edge-midpoints + 1
+  !! center), not 4. By the discrete turning-number argument, though, any
+  !! simple rectilinear polygon patch has exactly as many BOUNDING edges
+  !! as corners: 4 for any MxN rectangle, 6 for an L-shape, more for
+  !! anything jaggier or bordering a size-mismatched neighbor (which
+  !! forces extra boundary macrovertices/macroedges along the shared
+  !! side) -- exactly the faces that shouldn't be walked through to grow
+  !! a further brick.
+  !!
+  !! Opposite faces of a hex never share a vertex; adjacent faces always
+  !! share at least the vertices along their common edge -- so requiring
+  !! each of the 6 faces to have EXACTLY ONE zero-vertex-overlap partner
+  !! recovers the 3 opposite pairs (the relation is symmetric by
+  !! construction, so this always yields a consistent perfect matching
+  !! when it succeeds at all).
+  !!
+  !! Ineligible elements are left as all-zero-sentinel rows in
+  !! elm_loc_face -- same "never corrupt, just don't recurse there"
+  !! philosophy as grow_brick's own duplicate-abort (amge_coarsen.f90).
+  subroutine derive_elm_loc_face(mmsh)
+    type(macro_mesh_t), intent(inout) :: mmsh
+    integer(i4), allocatable :: eface_ptr(:), eface_idx(:)
+    integer(i4) :: e, ne, i, j, nf_e, slot
+    integer(i4) :: faces(6), opp(6), n_opp(6)
+    logical :: ok, placed(6)
+
+    call macro_mesh_elem_face_csr(mmsh, eface_ptr, eface_idx)
+    ne = mmsh%n_elem
+    if (allocated(mmsh%elm_loc_face)) deallocate(mmsh%elm_loc_face)
+    allocate(mmsh%elm_loc_face(6, ne))
+    mmsh%elm_loc_face = 0
+
+    do e = 1, ne
+       nf_e = eface_ptr(e + 1) - eface_ptr(e)
+       if (nf_e .ne. 6) cycle
+       do i = 1, 6
+          faces(i) = eface_idx(eface_ptr(e) + i)
+       end do
+
+       ok = .true.
+       do i = 1, 6
+          if (mmsh%face_edge_ptr(faces(i) + 1) - mmsh%face_edge_ptr(faces(i)) &
+               .ne. 4) then
+             ok = .false.
+             exit
+          end if
+       end do
+       if (.not. ok) cycle
+
+       n_opp = 0
+       opp = 0
+       do i = 1, 6
+          do j = 1, 6
+             if (i .eq. j) cycle
+             if (.not. faces_share_vertex(mmsh, faces(i), faces(j))) then
+                n_opp(i) = n_opp(i) + 1
+                opp(i) = j
+             end if
+          end do
+       end do
+       ok = .true.
+       do i = 1, 6
+          if (n_opp(i) .ne. 1) then
+             ok = .false.
+             exit
+          end if
+       end do
+       if (.not. ok) cycle
+
+       placed = .false.
+       slot = 0
+       do i = 1, 6
+          if (placed(i)) cycle
+          j = opp(i)
+          slot = slot + 1
+          mmsh%elm_loc_face(2 * slot - 1, e) = faces(i)
+          mmsh%elm_loc_face(2 * slot, e) = faces(j)
+          placed(i) = .true.
+          placed(j) = .true.
+       end do
+    end do
+  end subroutine derive_elm_loc_face
+
+  !> Do facets f1 and f2 share any vertex at all (full vertex set, not
+  !! just boundary corners)? Used by derive_elm_loc_face's opposite-face
+  !! test; distinct from the boundary-edge-sharing test used elsewhere
+  !! for crease detection.
+  pure function faces_share_vertex(mmsh, f1, f2) result(res)
+    type(macro_mesh_t), intent(in) :: mmsh
+    integer(i4), intent(in) :: f1, f2
+    logical :: res
+    integer(i4) :: p, q
+
+    res = .false.
+    do p = mmsh%face_vtx_ptr(f1) + 1, mmsh%face_vtx_ptr(f1 + 1)
+       do q = mmsh%face_vtx_ptr(f2) + 1, mmsh%face_vtx_ptr(f2 + 1)
+          if (mmsh%face_vtx_idx(p) .eq. mmsh%face_vtx_idx(q)) then
+             res = .true.
+             return
+          end if
+       end do
+    end do
+  end function faces_share_vertex
+
   !> Splice ghost elements' own vertex/face/edge CSR sub-tables (as
   !! received from neighboring ranks) into a copy of this rank's own
   !! mesh, producing a ghost-extended macro_mesh_t. This REPLACES the
@@ -1195,6 +1318,7 @@ contains
     if (allocated(this%edge_vtx)) deallocate(this%edge_vtx)
     if (allocated(this%face_el)) deallocate(this%face_el)
     if (allocated(this%face_nel)) deallocate(this%face_nel)
+    if (allocated(this%elm_loc_face)) deallocate(this%elm_loc_face)
     if (allocated(this%vert_id)) deallocate(this%vert_id)
     if (allocated(this%shared_vtx)) deallocate(this%shared_vtx)
     this%n_verts = 0; this%n_elem = 0; this%n_face = 0; this%n_edge = 0
