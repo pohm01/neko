@@ -55,6 +55,29 @@ module amge_coarsen
   !! matching benefit). Default on; disable for A/B comparison.
   logical, public :: amge_use_face_growth = .true.
 
+  !> target_size is a WEAK bound in the ordinary bscore growth loop
+  !! (greedy_grow_from_seedset): once a macroelement reaches target_size,
+  !! a further frontier candidate is still absorbed if it touches at
+  !! least this many already-included elements -- e.g. a leftover element
+  !! wedged against 3 faces of an otherwise-finished macroelement is a
+  !! bad fit anywhere else (whatever it doesn't join here can match at
+  !! most its remaining faces elsewhere), so it's better folded in even
+  !! if that overshoots target_size than left to become an awkward
+  !! small/singleton macroelement of its own. Does NOT apply to the
+  !! face-matching snap-in (see greedy_grow_from_seedset's header),
+  !! which has no upper limit at all -- only to the plain connectivity-
+  !! score competition. Growth via this weak bound still hard-stops at
+  !! amge_overgrow_factor * target_size (see below).
+  integer(i4), public :: amge_nice_shape_min_touch = 3
+
+  !> Hard ceiling on a macroelement's size, as a multiple of target_size,
+  !! applied only to the "weak bound" growth amge_nice_shape_min_touch
+  !! allows past target_size in the ordinary bscore loop -- a safety
+  !! valve against a long chain of well-connected candidates growing one
+  !! macroelement unboundedly. The face-matching snap-in is unaffected by
+  !! this (see amge_nice_shape_min_touch).
+  real(rp), public :: amge_overgrow_factor = 2.0_rp
+
   !> Running worst-case diagnostics accumulated across a level's
   !! macroelements by schur_extend, verifying eq.(48)-(53) of the AMGe
   !! theory note (see [[amge_theory_reference]]): symmetry of S_dM (52),
@@ -194,7 +217,11 @@ contains
     allocate(stamp(ne)); stamp = 0; epoch = 0
     allocate(queue(ne))
     allocate(patch(patch_cap), far(patch_cap))
-    allocate(worklist(max(target_size, 1)))
+    ! Sized to ne, not target_size: the face-matching snap-in in
+    ! greedy_grow_from_seedset has no upper limit (see its header), so a
+    ! macroelement's size is no longer bounded by target_size or even
+    ! amge_overgrow_factor * target_size.
+    allocate(worklist(max(ne, 1)))
     allocate(seed_set(patch_cap))
     allocate(face_q_e(6 * ne), face_q_slot(6 * ne))
     qh = 1; qt = 0
@@ -271,19 +298,28 @@ contains
   !! whenever a newly-absorbed element's neighbor is found to already
   !! belong to some OTHER macroelement C (not 0, not new_id), look up C's
   !! whole face patch there (face_patch, own=C, other_id=new_id) via
-  !! slot_toward, and absorb whichever of its far-side elements are still
-  !! unassigned directly -- bypassing the usual bscore competition for
-  !! those specific elements -- then scan their own neighbors too, via
-  !! `worklist` (so absorption can cascade: a snapped-in element may
-  !! itself bump into yet another macroelement). An element that turns
-  !! out to already belong to a THIRD macroelement at a genuine 3-way
-  !! junction is simply left alone -- an unavoidable corner, not a bug.
+  !! slot_toward, and absorb EVERY still-unassigned far-side element of
+  !! that patch, unconditionally -- a partial face match would defeat
+  !! the whole point of snapping to it, so this has no target_size cap
+  !! at all; the only bound is face_patch's own patch_cap safety valve
+  !! -- then scan their own neighbors too, via `worklist` (so absorption
+  !! can cascade: a snapped-in element may itself bump into yet another
+  !! macroelement). An element that turns out to already belong to a
+  !! THIRD macroelement at a genuine 3-way junction is simply left alone
+  !! -- an unavoidable corner, not a bug.
   !!
-  !! Stops at target_size or when the frontier is exhausted, exactly as
-  !! the original single-seed method did. On return, `worklist(1:cnt)`
-  !! holds every element absorbed into this macroelement, in absorption
-  !! order -- the caller reuses this directly as the finished
-  !! macroelement's member list, no separate scan needed.
+  !! The ordinary bscore competition, in contrast, treats target_size as
+  !! a WEAK bound: once cnt reaches target_size, the best remaining
+  !! frontier candidate is still absorbed if it's well-connected enough
+  !! (should_accept, see amge_nice_shape_min_touch's header), up to a
+  !! hard ceiling of amge_overgrow_factor * target_size.
+  !!
+  !! On return, `worklist(1:cnt)` holds every element absorbed into this
+  !! macroelement, in absorption order -- the caller reuses this
+  !! directly as the finished macroelement's member list, no separate
+  !! scan needed. `worklist` must be sized >= lvl%mmsh%n_elem by the
+  !! caller: since the snap-in has no upper limit, cnt is no longer
+  !! bounded by target_size or even amge_overgrow_factor * target_size.
   subroutine greedy_grow_from_seedset(lvl, adj_ptr, adj_idx, target_size, &
        part, new_id, seed_set, n_seed, stamp, epoch, queue, patch, far, &
        worklist, cnt)
@@ -298,12 +334,14 @@ contains
     integer(i4), intent(out) :: cnt
     integer(i4), allocatable :: frontier(:)
     logical, allocatable :: infr(:)
-    integer(i4) :: ne, nfr, best, bscore, sc, a, q, e, c, si
+    integer(i4) :: ne, nfr, best, bscore, sc, a, q, e, c, si, hard_max
     integer(i4) :: wn, wi, v, dslot, npatch, k
     logical :: use_faces
 
     ne = lvl%mmsh%n_elem
     use_faces = allocated(lvl%mmsh%elm_loc_face)
+    hard_max = max(target_size, &
+         nint(real(target_size, rp) * amge_overgrow_factor))
     allocate(frontier(ne), infr(ne))
     infr = .false.
     nfr = 0
@@ -334,7 +372,7 @@ contains
                      far, npatch)
                 do k = 1, npatch
                    if (far(k) .ne. 0) then
-                      if (part(far(k)) .eq. 0 .and. cnt .lt. target_size) then
+                      if (part(far(k)) .eq. 0) then
                          part(far(k)) = new_id
                          cnt = cnt + 1
                          wn = wn + 1; worklist(wn) = far(k)
@@ -344,12 +382,14 @@ contains
              end if
           end do
        end do
-       if (cnt .ge. target_size .or. nfr .eq. 0) exit
+       if (nfr .eq. 0) exit
        ! grow one element at a time: score every frontier candidate by
        ! how many of ITS neighbors are already in the current
        ! macroelement (sc), absorb the best-connected one (best/bscore)
        ! -- this is what keeps macroelements compact/blob-shaped rather
-       ! than growing thin tendrils.
+       ! than growing thin tendrils. target_size is a WEAK bound here:
+       ! once reached, the winner is still absorbed if it's well
+       ! connected enough (should_accept), up to hard_max.
        best = 0; bscore = -1
        do a = 1, nfr
           e = frontier(a)
@@ -363,6 +403,8 @@ contains
           end if
        end do
        if (best .eq. 0) exit
+       if (.not. should_accept(cnt, target_size, hard_max, bscore, &
+            amge_nice_shape_min_touch)) exit
        c = frontier(best)
        frontier(best) = frontier(nfr); nfr = nfr - 1
        part(c) = new_id
@@ -370,6 +412,21 @@ contains
        wn = wn + 1; worklist(wn) = c
     end do
   end subroutine greedy_grow_from_seedset
+
+  !> target_size acceptance rule for the ordinary bscore growth loop
+  !! (see greedy_grow_from_seedset, and amge_nice_shape_min_touch/
+  !! amge_overgrow_factor's headers for the rationale): always accept
+  !! below target_size; past it, accept only a candidate connected
+  !! enough to be a clearly better fit here than elsewhere (sc >=
+  !! min_touch), and only up to hard_max.
+  pure function should_accept(cnt, target_size, hard_max, sc, min_touch) &
+       result(accept)
+    integer(i4), intent(in) :: cnt, target_size, hard_max, sc, min_touch
+    logical :: accept
+
+    accept = (cnt .lt. target_size) .or. &
+         (cnt .lt. hard_max .and. sc .ge. min_touch)
+  end function should_accept
 
   !> Find the local slot of element e whose neighbor is v (e, v assumed
   !! face-adjacent, e.g. via the dual graph adj_ptr/adj_idx) -- a small
@@ -454,7 +511,15 @@ contains
        call step_neighbor(mmsh, elm_loc_face, v, dslot, fe, fslot)
        v_other = 0
        if (fe .ne. 0) v_other = part(fe)
-       if (v_other .ne. other_id) cycle   ! not part of this flat run
+       ! Accept a far side that's EITHER already other_id or still
+       ! unassigned (0) -- reject only a genuine third macroelement (the
+       ! 3-way-junction case). For the seeding call (other_id=0) this is
+       ! unchanged (both conditions collapse to the same test); for the
+       ! snapping call (other_id=new_id) this is what actually lets
+       ! still-unassigned far-side elements into the patch, rather than
+       ! only ones already claimed by new_id (which face_patch would
+       ! then be handing back as "new" to absorb -- a no-op).
+       if (v_other .ne. other_id .and. v_other .ne. 0) cycle
        n = n + 1
        if (n .gt. cap) then
           n = 0
