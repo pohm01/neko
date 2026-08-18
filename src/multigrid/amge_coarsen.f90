@@ -25,7 +25,7 @@ module amge_coarsen
   use mpi_f08, only : MPI_Barrier
   use amge_topology, only : macro_topology_t, macro_mesh_t, &
        macro_topology_build_next_level_owned, macro_mesh_elem_face_csr, &
-       macro_mesh_splice_ghost, derive_elm_loc_face
+       macro_mesh_splice_ghost
   use amge_level, only : amge_level_t
   use amge_ghost, only : amge_ghost_t, amge_ghost_exchange, amge_ghost_part_ext
   implicit none
@@ -41,18 +41,19 @@ module amge_coarsen
   !! easy to flip off for a build that wants to skip the extra work.
   logical, public :: AMGE_DEBUG_CHECKS = .true.
 
-  !> Toggle for the level-0 "logical brick" growth pass run at the start
-  !! of agglomerate_level (see agglomerate_bricks_pass): walks the fine
-  !! hex mesh's fixed local face template in straight lines to grow
-  !! axis-aligned k1 x k2 x k3 macroelements, whose macrofaces are flat
-  !! by construction (creases can then only occur at a brick's own
-  !! bounded number of corners, not once per boundary irregularity, as
-  !! the organically-shaped greedy growth below can produce). Only fires
-  !! where lvl%mmsh%elm_loc_face is allocated (level 0 -- coarser levels'
-  !! macroelements have no fixed face template to walk); everywhere else
-  !! this is a no-op and growth is exactly the plain greedy method below.
-  !! Default on; disable for A/B comparison.
-  logical, public :: amge_use_brick_growth = .true.
+  !> Toggle for level-0 face-matching frontier growth in
+  !! agglomerate_face_growth (see that subroutine's header): grows each
+  !! macroelement with the same connectivity-score frontier method as
+  !! always, but seeds each new one from a previously-finished
+  !! macroelement's WHOLE exposed face (not a single point) and, when
+  !! growth touches an already-finished neighbor, snaps its own boundary
+  !! to match that neighbor's whole face instead of a partial, jagged
+  !! touch. Only fires where lvl%mmsh%elm_loc_face is allocated (level 0
+  !! -- coarser levels' macroelements have no fixed face template to
+  !! walk); everywhere else this degrades to plain single-element
+  !! lexicographic seeding (still correct, just without the face-
+  !! matching benefit). Default on; disable for A/B comparison.
+  logical, public :: amge_use_face_growth = .true.
 
   !> Running worst-case diagnostics accumulated across a level's
   !! macroelements by schur_extend, verifying eq.(48)-(53) of the AMGe
@@ -83,31 +84,19 @@ module amge_coarsen
 contains
 
   !> Compact-growth agglomeration on the element dual graph (adjacency =
-  !! shared facet): absorb the frontier element with the most
-  !! connections into the current cluster. A seed left with no
-  !! unassigned neighbor (boxed in entirely by earlier clusters) is
-  !! folded into its best-connected already-assigned neighboring
-  !! macroelement instead of becoming its own singleton macroelement;
-  !! only a genuinely isolated element (no facet neighbors at all) ends
-  !! up as a singleton.
+  !! shared facet). At level 0, growth is driven by
+  !! agglomerate_face_growth (face-matching frontier growth -- see its
+  !! header); everywhere else (no fixed face template to walk) it
+  !! degrades to the same connectivity-score frontier method, seeded one
+  !! element at a time in lexicographic order.
   !! (Integration note: tree_amg's greedy aggregation plays this role.)
-  !!
-  !! At level 0, a preliminary logical-brick pass (agglomerate_bricks_pass,
-  !! below) runs first and claims whatever it can as flat-faced
-  !! k1 x k2 x k3 blocks; only elements it leaves unassigned reach this
-  !! greedy method at all (its `if (part(s) .ne. 0) cycle` skip already
-  !! handles that with no changes needed here).
   subroutine agglomerate_level(lvl, target_size, part, n_macro)
     type(amge_level_t), intent(in) :: lvl
     integer(i4), intent(in) :: target_size
     integer(i4), allocatable, intent(inout) :: part(:)
     integer(i4), intent(out) :: n_macro
-    integer(i4), allocatable :: adj_ptr(:), adj_idx(:), fill(:), frontier(:)
-    logical, allocatable :: infr(:)
-    integer(i4) :: ne, f, e, a, b, s, cnt, nfr, best, bscore, sc, q, c
-    integer(i4) :: i, j, tmp
-    integer(i4), allocatable :: rand_order(:)
-    real(kind=rp) :: r
+    integer(i4), allocatable :: adj_ptr(:), adj_idx(:), fill(:)
+    integer(i4) :: ne, f, e, a, b
     integer(i4), allocatable :: sizes(:)   !< debug: final size of each cluster
 
     ne = lvl%mmsh%n_elem
@@ -141,208 +130,350 @@ contains
        end if
     end do
 
-    ! Initialize a random permutation
-    allocate( rand_order( ne ) )
-    do i = 1, ne
-       rand_order(i) = i
-    end do
-    !! Shuffle rand_order using Fisher-Yates algorithm
-    !do i = ne, 2, -1
-    !   call random_number(r)
-    !   j = int(r * real(i, kind=rp)) + 1
-    !   tmp = rand_order(i)
-    !   rand_order(i) = rand_order(j)
-    !   rand_order(j) = tmp
-    !end do
-
-    ! ---- greedy compact-growth clustering over rand_order. part(e)==0
-    ! means "unassigned"; scanning rand_order in order and skipping
-    ! already-assigned elements means every element becomes either a new
-    ! cluster's seed or gets absorbed into one, so every element ends up
-    ! in exactly one macroelement (part fully covers 1..n_macro).
     part = 0
     n_macro = 0
-    allocate(frontier(ne), infr(ne))
     allocate(sizes(ne))   ! upper bound on n_macro; only sizes(1:n_macro) used
 
-    call agglomerate_bricks_pass(lvl, target_size, part, n_macro, sizes)
-
-    do i = 1, ne
-       s = rand_order(i)
-       if (part(s) .ne. 0) cycle
-       ! seed s's frontier (unassigned neighbors not already queued --
-       ! infr guards against queuing the same candidate twice from two
-       ! different absorbed members) before deciding whether to grow a
-       ! new cluster from it
-       nfr = 0
-       infr = .false.
-       do q = adj_ptr(s) + 1, adj_ptr(s + 1)
-          e = adj_idx(q)
-          if (part(e) .eq. 0 .and. .not. infr(e)) then
-             nfr = nfr + 1; frontier(nfr) = e; infr(e) = .true.
-          end if
-       end do
-
-       !if (nfr .eq. 0) then
-       !   ! s has no unassigned neighbor left to grow a new cluster into
-       !   ! -- every neighbor was already claimed by an earlier cluster.
-       !   ! Rather than leave s as its own singleton macroelement (a
-       !   ! degenerate coarse dof), fold it into whichever already-
-       !   ! assigned neighboring macroelement it shares the most facets
-       !   ! with. Only a genuinely isolated element (no facet neighbors
-       !   ! at all) falls through to become a singleton below.
-       !   block
-       !     integer(i4) :: best_id, best_cnt, qa, qb, deg
-       !     best_id = 0; best_cnt = 0
-       !     do qa = adj_ptr(s) + 1, adj_ptr(s + 1)
-       !        if (part(adj_idx(qa)) .eq. 0) cycle
-       !        deg = 0
-       !        do qb = adj_ptr(s) + 1, adj_ptr(s + 1)
-       !           if (part(adj_idx(qb)) .eq. part(adj_idx(qa))) deg = deg + 1
-       !        end do
-       !        if (deg .gt. best_cnt) then
-       !           best_cnt = deg; best_id = part(adj_idx(qa))
-       !        end if
-       !     end do
-       !     if (best_id .gt. 0) then
-       !        part(s) = best_id
-       !        sizes(best_id) = sizes(best_id) + 1
-       !        cycle
-       !     end if
-       !   end block
-       !end if
-
-       ! seed a new cluster at s (frontier already built above)
-       n_macro = n_macro + 1
-       part(s) = n_macro
-       cnt = 1
-       ! grow the cluster one element at a time until it reaches
-       ! target_size or the frontier runs dry (a small pocket of
-       ! elements with nowhere further to grow). Each round scores every
-       ! frontier candidate by how many of ITS neighbors are already in
-       ! the current cluster (sc), and absorbs the best-connected one
-       ! (best/bscore) -- this is what keeps clusters compact/blob-shaped
-       ! rather than growing thin tendrils.
-       do while (cnt .lt. target_size .and. nfr .gt. 0)
-          best = 0; bscore = -1
-          do a = 1, nfr
-             e = frontier(a)
-             if (part(e) .ne. 0) cycle
-             sc = 0
-             do q = adj_ptr(e) + 1, adj_ptr(e + 1)
-                if (part(adj_idx(q)) .eq. n_macro) sc = sc + 1
-             end do
-             if (sc .gt. bscore) then
-                bscore = sc; best = a
-             end if
-          end do
-          if (best .eq. 0) exit
-          ! absorb the winner (swap-with-last removal from the frontier,
-          ! order doesn't matter here) and extend the frontier with its
-          ! own unassigned, not-yet-queued neighbors
-          c = frontier(best)
-          frontier(best) = frontier(nfr); nfr = nfr - 1
-          part(c) = n_macro
-          cnt = cnt + 1
-          do q = adj_ptr(c) + 1, adj_ptr(c + 1)
-             e = adj_idx(q)
-             if (part(e) .eq. 0 .and. .not. infr(e)) then
-                nfr = nfr + 1; frontier(nfr) = e; infr(e) = .true.
-             end if
-          end do
-       end do
-       sizes(n_macro) = cnt
-    end do
+    call agglomerate_face_growth(lvl, adj_ptr, adj_idx, target_size, part, &
+         n_macro, sizes)
 
     if (AMGE_DEBUG_CHECKS) call report_size_stats('agglomeration: elements/macroelement', &
          sizes(1:n_macro))
   end subroutine agglomerate_level
 
-  !> Level-0 logical-brick growth pass, run before the ordinary greedy
-  !! growth in agglomerate_level: grows axis-aligned k1 x k2 x k3
-  !! macroelements by walking the fine hex mesh's fixed local face
-  !! template in straight lines (see step_neighbor/grow_brick), so two
-  !! bricks meet along a whole flat macroface by construction instead of
-  !! an organically-shaped, potentially jagged boundary. No-op unless
-  !! lvl%mmsh%elm_loc_face is allocated (only true at level 0 --
-  !! coarser levels' macroelements have no fixed face template to walk).
-  !! Seeds are visited in plain lexicographic order (not the shuffled
-  !! rand_order the greedy pass below uses): raster-order seeding tiles
-  !! a structured region with minimal gaps, and this pass's own quality
-  !! doesn't depend on the tie-break rand_order exists for. Whatever this
-  !! pass leaves unassigned (irregular regions, aborted bricks, remainder
-  !! near boundaries) falls straight through to the existing greedy
-  !! method, which already skips already-assigned elements.
-  subroutine agglomerate_bricks_pass(lvl, target_size, part, n_macro, sizes)
+  !> Level-0 face-matching frontier growth (replaces the old fixed-shape
+  !! brick growth): grows each macroelement via greedy_grow_from_seedset
+  !! (the same connectivity-score frontier method used throughout this
+  !! module), but seeds every macroelement after the first from the
+  !! WHOLE exposed-face footprint of a previously-finished macroelement
+  !! (via face_patch, other_id=0) rather than a single point, and snaps a
+  !! growing macroelement's own boundary to match a neighbor's whole face
+  !! when it bumps into one (also via face_patch, handled inside
+  !! greedy_grow_from_seedset) instead of a partial, jagged touch.
+  !!
+  !! `face_q_e`/`face_q_slot` is a queue of (element, slot) pairs still
+  !! facing unassigned territory, pushed after each macroelement finishes
+  !! (one entry per exposed slot of its own members -- redundant entries
+  !! from the same underlying face patch are harmless, just some wasted
+  !! re-computation, since face_patch re-checks "still unassigned" and
+  !! simply yields nothing the second time). Popping an entry re-verifies
+  !! it's still valid (may have been claimed meanwhile by a different
+  !! path) before calling face_patch.
+  !!
+  !! Whenever the queue is empty (including the very first call, and any
+  !! time a whole connected region has been fully claimed), the next
+  !! macroelement is bootstrapped from the next unassigned element in
+  !! lexicographic order instead -- this is what makes the loop cover
+  !! every element with no separate fallback pass needed afterward, and
+  !! is also the ONLY growth mode at levels >= 1 (elm_loc_face never
+  !! allocated there), reproducing the plain single-element frontier
+  !! method exactly.
+  !!
+  !! No-op on the face-matching side (falls straight through to plain
+  !! lexicographic bootstrap seeding throughout) unless
+  !! lvl%mmsh%elm_loc_face is allocated (level 0 only).
+  subroutine agglomerate_face_growth(lvl, adj_ptr, adj_idx, target_size, &
+       part, n_macro, sizes)
     type(amge_level_t), intent(in) :: lvl
+    integer(i4), intent(in) :: adj_ptr(:), adj_idx(:)
     integer(i4), intent(in) :: target_size
     integer(i4), intent(inout) :: part(:)
     integer(i4), intent(inout) :: n_macro
     integer(i4), intent(inout) :: sizes(:)
-    integer(i4) :: k1, k2, k3, ne, s, n, n_bricks, n_claimed
-    integer(i4), allocatable :: elems(:)
-
-    if (.not. amge_use_brick_growth) return
-    if (.not. allocated(lvl%mmsh%elm_loc_face)) return
+    integer(i4) :: ne, s, cnt, e0, dslot, npatch, k, nseed, i, cursor
+    integer(i4), allocatable :: stamp(:), queue(:), patch(:), far(:)
+    integer(i4), allocatable :: worklist(:), seed_set(:)
+    integer(i4), allocatable :: face_q_e(:), face_q_slot(:)
+    integer(i4) :: epoch, patch_cap, qh, qt, fe, fslot
+    logical :: use_faces
 
     ne = lvl%mmsh%n_elem
-    call pick_brick_shape(target_size, k1, k2, k3)
-    allocate(elems(k1 * k2 * k3))
+    use_faces = amge_use_face_growth .and. allocated(lvl%mmsh%elm_loc_face)
 
-    n_bricks = 0; n_claimed = 0
-    do s = 1, ne
-       if (part(s) .ne. 0) cycle
-       ! At level 0 every element has a valid elm_loc_face row (the fixed
-       ! hex template always fully populates it); at level >= 1 the table
-       ! is only PARTIALLY populated (derive_elm_loc_face, amge_topology.
-       ! f90), so an ineligible seed (all-zero sentinel row) must be
-       ! skipped here rather than handed to grow_brick.
-       if (lvl%mmsh%elm_loc_face(1, s) .eq. 0) cycle
-       call grow_brick(lvl%mmsh, lvl%mmsh%elm_loc_face, part, s, k1, k2, k3, &
-            elems, n)
-       if (n .eq. 0) cycle   ! leave for the greedy fallback below
+    patch_cap = max(4 * target_size, 8)
+    allocate(stamp(ne)); stamp = 0; epoch = 0
+    allocate(queue(ne))
+    allocate(patch(patch_cap), far(patch_cap))
+    allocate(worklist(max(target_size, 1)))
+    allocate(seed_set(patch_cap))
+    allocate(face_q_e(6 * ne), face_q_slot(6 * ne))
+    qh = 1; qt = 0
+    cursor = 1
+
+    do
+       nseed = 0
+       if (use_faces) then
+          do while (qt .ge. qh)
+             e0 = face_q_e(qh); dslot = face_q_slot(qh); qh = qh + 1
+             if (part(e0) .eq. 0) cycle   ! shouldn't happen, be safe
+             call step_neighbor(lvl%mmsh, lvl%mmsh%elm_loc_face, e0, &
+                  dslot, fe, fslot)
+             if (fe .ne. 0) cycle   ! no longer exposes "unassigned"
+             call face_patch(lvl%mmsh, lvl%mmsh%elm_loc_face, part, e0, &
+                  dslot, part(e0), 0, stamp, epoch, queue, patch, far, npatch)
+             if (npatch .eq. 0) cycle
+             nseed = 0
+             do k = 1, npatch
+                if (far(k) .ne. 0) then
+                   if (part(far(k)) .eq. 0) then
+                      nseed = nseed + 1
+                      seed_set(nseed) = far(k)
+                   end if
+                end if
+             end do
+             if (nseed .gt. 0) exit
+          end do
+       end if
+
+       if (nseed .eq. 0) then
+          ! bootstrap: next unassigned element in lexicographic order
+          ! (cursor only ever advances, so this is O(ne) amortized over
+          ! the whole run, not per call)
+          s = 0
+          do while (cursor .le. ne)
+             if (part(cursor) .eq. 0) then
+                s = cursor
+                exit
+             end if
+             cursor = cursor + 1
+          end do
+          if (s .eq. 0) exit   ! every element assigned -- done
+          nseed = 1; seed_set(1) = s
+       end if
+
        n_macro = n_macro + 1
-       part(elems(1:n)) = n_macro
-       sizes(n_macro) = n
-       n_bricks = n_bricks + 1
-       n_claimed = n_claimed + n
+       call greedy_grow_from_seedset(lvl, adj_ptr, adj_idx, target_size, &
+            part, n_macro, seed_set, nseed, stamp, epoch, queue, patch, &
+            far, worklist, cnt)
+       sizes(n_macro) = cnt
+
+       if (use_faces) then
+          do i = 1, cnt
+             e0 = worklist(i)
+             do k = 1, 6
+                call step_neighbor(lvl%mmsh, lvl%mmsh%elm_loc_face, e0, k, &
+                     fe, fslot)
+                if (fe .ne. 0) cycle
+                qt = qt + 1
+                face_q_e(qt) = e0
+                face_q_slot(qt) = k
+             end do
+          end do
+       end if
+    end do
+  end subroutine agglomerate_face_growth
+
+  !> Grow one macroelement (id `new_id`) from `seed_set` via the SAME
+  !! best-connected-neighbor frontier growth used throughout this module,
+  !! generalized to (a) start from multiple seed elements at once (all
+  !! immediately absorbed, before any frontier scoring), and (b) snap to
+  !! a neighboring macroelement's whole face when growth touches one:
+  !! whenever a newly-absorbed element's neighbor is found to already
+  !! belong to some OTHER macroelement C (not 0, not new_id), look up C's
+  !! whole face patch there (face_patch, own=C, other_id=new_id) via
+  !! slot_toward, and absorb whichever of its far-side elements are still
+  !! unassigned directly -- bypassing the usual bscore competition for
+  !! those specific elements -- then scan their own neighbors too, via
+  !! `worklist` (so absorption can cascade: a snapped-in element may
+  !! itself bump into yet another macroelement). An element that turns
+  !! out to already belong to a THIRD macroelement at a genuine 3-way
+  !! junction is simply left alone -- an unavoidable corner, not a bug.
+  !!
+  !! Stops at target_size or when the frontier is exhausted, exactly as
+  !! the original single-seed method did. On return, `worklist(1:cnt)`
+  !! holds every element absorbed into this macroelement, in absorption
+  !! order -- the caller reuses this directly as the finished
+  !! macroelement's member list, no separate scan needed.
+  subroutine greedy_grow_from_seedset(lvl, adj_ptr, adj_idx, target_size, &
+       part, new_id, seed_set, n_seed, stamp, epoch, queue, patch, far, &
+       worklist, cnt)
+    type(amge_level_t), intent(in) :: lvl
+    integer(i4), intent(in) :: adj_ptr(:), adj_idx(:)
+    integer(i4), intent(in) :: target_size
+    integer(i4), intent(inout) :: part(:)
+    integer(i4), intent(in) :: new_id
+    integer(i4), intent(in) :: seed_set(:), n_seed
+    integer(i4), intent(inout) :: stamp(:), epoch, queue(:), patch(:), far(:)
+    integer(i4), intent(inout) :: worklist(:)
+    integer(i4), intent(out) :: cnt
+    integer(i4), allocatable :: frontier(:)
+    logical, allocatable :: infr(:)
+    integer(i4) :: ne, nfr, best, bscore, sc, a, q, e, c, si
+    integer(i4) :: wn, wi, v, dslot, npatch, k
+    logical :: use_faces
+
+    ne = lvl%mmsh%n_elem
+    use_faces = allocated(lvl%mmsh%elm_loc_face)
+    allocate(frontier(ne), infr(ne))
+    infr = .false.
+    nfr = 0
+    cnt = 0
+    wn = 0
+
+    do si = 1, n_seed
+       part(seed_set(si)) = new_id
+       cnt = cnt + 1
+       wn = wn + 1; worklist(wn) = seed_set(si)
     end do
 
-    if (AMGE_DEBUG_CHECKS) then
-       write(*, '("   [check] rank ", I0, ": brick growth: ", I0, &
-            & " bricks (", I0, "x", I0, "x", I0, "), ", I0, "/", I0, &
-            & " elements (", F5.1, "%)")') &
-            pe_rank, n_bricks, k1, k2, k3, n_claimed, ne, &
-            100.0_rp * real(n_claimed, rp) / real(max(ne, 1), rp)
-    end if
-  end subroutine agglomerate_bricks_pass
-
-  !> Most cube-like factorization of target_size into k1<=k2<=k3 with
-  !! k1*k2*k3=target_size (minimizes k1*k2+k2*k3+k1*k3, i.e. box surface
-  !! area for fixed volume -- the same compactness principle
-  !! agglomerate_level's own greedy bscore growth aims for). Falls back
-  !! to (1,1,target_size) for a target_size with no better factorization
-  !! (e.g. prime), giving a straight pencil rather than failing.
-  pure subroutine pick_brick_shape(target_size, k1, k2, k3)
-    integer(i4), intent(in) :: target_size
-    integer(i4), intent(out) :: k1, k2, k3
-    integer(i4) :: a, b, c, best_score, score
-
-    k1 = 1; k2 = 1; k3 = max(target_size, 1)
-    best_score = k1 * k2 + k2 * k3 + k1 * k3
-    do a = 1, max(target_size, 1)
-       if (mod(target_size, a) .ne. 0) cycle
-       do b = a, target_size / a
-          if (mod(target_size / a, b) .ne. 0) cycle
-          c = target_size / (a * b)
-          if (c .lt. b) cycle
-          score = a * b + b * c + a * c
-          if (score .lt. best_score) then
-             best_score = score; k1 = a; k2 = b; k3 = c
+    wi = 1
+    do
+       do while (wi .le. wn)
+          v = worklist(wi); wi = wi + 1
+          do q = adj_ptr(v) + 1, adj_ptr(v + 1)
+             e = adj_idx(q)
+             if (part(e) .eq. 0) then
+                if (.not. infr(e)) then
+                   nfr = nfr + 1; frontier(nfr) = e; infr(e) = .true.
+                end if
+             else if (use_faces .and. part(e) .ne. new_id) then
+                dslot = slot_toward(lvl%mmsh, lvl%mmsh%elm_loc_face, e, v)
+                if (dslot .eq. 0) cycle
+                call face_patch(lvl%mmsh, lvl%mmsh%elm_loc_face, part, e, &
+                     dslot, part(e), new_id, stamp, epoch, queue, patch, &
+                     far, npatch)
+                do k = 1, npatch
+                   if (far(k) .ne. 0) then
+                      if (part(far(k)) .eq. 0 .and. cnt .lt. target_size) then
+                         part(far(k)) = new_id
+                         cnt = cnt + 1
+                         wn = wn + 1; worklist(wn) = far(k)
+                      end if
+                   end if
+                end do
+             end if
+          end do
+       end do
+       if (cnt .ge. target_size .or. nfr .eq. 0) exit
+       ! grow one element at a time: score every frontier candidate by
+       ! how many of ITS neighbors are already in the current
+       ! macroelement (sc), absorb the best-connected one (best/bscore)
+       ! -- this is what keeps macroelements compact/blob-shaped rather
+       ! than growing thin tendrils.
+       best = 0; bscore = -1
+       do a = 1, nfr
+          e = frontier(a)
+          if (part(e) .ne. 0) cycle
+          sc = 0
+          do q = adj_ptr(e) + 1, adj_ptr(e + 1)
+             if (part(adj_idx(q)) .eq. new_id) sc = sc + 1
+          end do
+          if (sc .gt. bscore) then
+             bscore = sc; best = a
           end if
        end do
+       if (best .eq. 0) exit
+       c = frontier(best)
+       frontier(best) = frontier(nfr); nfr = nfr - 1
+       part(c) = new_id
+       cnt = cnt + 1
+       wn = wn + 1; worklist(wn) = c
     end do
-  end subroutine pick_brick_shape
+  end subroutine greedy_grow_from_seedset
+
+  !> Find the local slot of element e whose neighbor is v (e, v assumed
+  !! face-adjacent, e.g. via the dual graph adj_ptr/adj_idx) -- a small
+  !! O(6) scan, used to recover "the direction back toward v" needed to
+  !! call face_patch when growth bumps into v's macroelement. Returns 0
+  !! if no such slot is found (shouldn't happen given e, v are adjacent,
+  !! but callers treat 0 as "skip" defensively).
+  function slot_toward(mmsh, elm_loc_face, e, v) result(slot)
+    type(macro_mesh_t), intent(in) :: mmsh
+    integer(i4), intent(in) :: elm_loc_face(:,:)
+    integer(i4), intent(in) :: e, v
+    integer(i4) :: slot
+    integer(i4) :: f, oe
+
+    do slot = 1, 6
+       f = elm_loc_face(slot, e)
+       if (mmsh%face_nel(f) .eq. 2) then
+          oe = mmsh%face_el(1, f)
+          if (oe .eq. e) oe = mmsh%face_el(2, f)
+          if (oe .eq. v) return
+       end if
+    end do
+    slot = 0
+  end function slot_toward
+
+  !> Flood-fill the flat patch of `own`'s own elements (own is always a
+  !! real macroelement id here, never "unassigned") that all expose the
+  !! SAME `other_id` (0 = boundary/unassigned; otherwise another
+  !! macroelement's id) through the SAME local slot `dslot`, starting
+  !! from seed element `e0`. Walks the 4 in-plane slots (the two
+  !! axis-pairs other than dslot's own pair) via step_neighbor,
+  !! restricted to elements with part==own; stops expanding a direction
+  !! when it leaves `own` (that's own's own edge or corner) or its dslot
+  !! no longer exposes the same other_id (a genuine change of what's
+  !! beyond, not just a pass-through point).
+  !!
+  !! Reuses the same "trust a fresh element's numeric slot to mean the
+  !! same physical direction" assumption the old brick-growth code relied
+  !! on at its branch points, valid here without extra bookkeeping
+  !! because at level 0 the slot-pairing {1,2}/{3,4}/{5,6} is a FIXED
+  !! template invariant (macro_mesh_init_hex), not something that needs
+  !! per-element rediscovery.
+  !!
+  !! `stamp`/`epoch` are a reusable "visited" marker and `queue` a
+  !! reusable BFS scratch array (both sized >= mmsh%n_elem, owned by the
+  !! top-level caller) so repeated calls -- one per queued face, one per
+  !! bump-into event -- don't each pay an O(n_elem) allocation. `patch`/
+  !! `far` are caller-sized; a patch that would exceed that size aborts
+  !! (n=0) as a cheap safety valve for "this region isn't reliably
+  !! locally structured" -- same philosophy as the old brick-growth
+  !! duplicate-abort; callers fall back to single-element behavior.
+  !!
+  !! Two uses: (1) seeding -- own = a just-finished macroelement,
+  !! other_id = 0, far (deduplicated, re-checked still-unassigned)
+  !! becomes the next macroelement's seed set; (2) snapping -- own = the
+  !! macroelement just bumped into, other_id = the growing macroelement's
+  !! own id, e0 = the contacted element, dslot = its slot facing back
+  !! toward the growing macroelement, far = the growing macroelement's
+  !! own candidate elements to pull in directly.
+  subroutine face_patch(mmsh, elm_loc_face, part, e0, dslot, own, other_id, &
+       stamp, epoch, queue, patch, far, n)
+    type(macro_mesh_t), intent(in) :: mmsh
+    integer(i4), intent(in) :: elm_loc_face(:,:)
+    integer(i4), intent(in) :: part(:)
+    integer(i4), intent(in) :: e0, dslot, own, other_id
+    integer(i4), intent(inout) :: stamp(:)
+    integer(i4), intent(inout) :: epoch
+    integer(i4), intent(inout) :: queue(:)
+    integer(i4), intent(out) :: patch(:), far(:)
+    integer(i4), intent(out) :: n
+    integer(i4), parameter :: OPP(6) = [2, 1, 4, 3, 6, 5]
+    integer(i4) :: qhead, qtail, v, w, wslot, fe, fslot, p, v_other, cap
+
+    epoch = epoch + 1
+    cap = size(patch)
+    qhead = 1; qtail = 1
+    queue(1) = e0
+    stamp(e0) = epoch
+    n = 0
+    do while (qhead .le. qtail)
+       v = queue(qhead); qhead = qhead + 1
+       call step_neighbor(mmsh, elm_loc_face, v, dslot, fe, fslot)
+       v_other = 0
+       if (fe .ne. 0) v_other = part(fe)
+       if (v_other .ne. other_id) cycle   ! not part of this flat run
+       n = n + 1
+       if (n .gt. cap) then
+          n = 0
+          return
+       end if
+       patch(n) = v
+       far(n) = fe
+       do p = 1, 6
+          if (p .eq. dslot .or. p .eq. OPP(dslot)) cycle
+          call step_neighbor(mmsh, elm_loc_face, v, p, w, wslot)
+          if (w .eq. 0) cycle
+          if (part(w) .ne. own) cycle
+          if (stamp(w) .eq. epoch) cycle
+          stamp(w) = epoch
+          qtail = qtail + 1
+          queue(qtail) = w
+       end do
+    end do
+  end subroutine face_patch
 
   !> Step from element e via local face-slot `slot` (1..6, loc_face
   !! ordering {1,2}=-x/+x, {3,4}=-y/+y, {5,6}=-z/+z, see
@@ -352,14 +483,15 @@ contains
   !! slot's opposite. This is what makes the walk robust to per-element
   !! local-numbering differences: only each element's own opposite-face
   !! pairing is assumed (always true of any hex), never that two
-  !! face-adjacent elements number their local slots the same way.
+  !! face-adjacent elements number their local slots the same way. Used
+  !! by face_patch's flood-fill and by slot_toward/
+  !! greedy_grow_from_seedset's bump-into handling.
   !! next_e=0 at a physical/rank boundary (face_nel==1) OR when the
   !! neighbor landed on has no matching slot in its own elm_loc_face row
-  !! -- expected whenever that neighbor is brick-ineligible (all-zero
-  !! sentinel row; see derive_elm_loc_face in amge_topology.f90, which
-  !! only partially populates elm_loc_face at level >= 1). Treated
-  !! exactly like a boundary: the caller's existing "next_e==0" shrink
-  !! logic already handles it, never corrupts.
+  !! -- only possible if elm_loc_face is partially populated, which
+  !! doesn't currently happen (level 0's elm_loc_face, from
+  !! macro_mesh_init_hex, is always fully populated); kept as a graceful
+  !! "treat like a boundary" fallback rather than an error regardless.
   subroutine step_neighbor(mmsh, elm_loc_face, e, slot, next_e, next_slot)
     type(macro_mesh_t), intent(in) :: mmsh
     integer(i4), intent(in) :: elm_loc_face(:,:)
@@ -383,145 +515,6 @@ contains
     end do
     next_e = 0; next_slot = 0
   end subroutine step_neighbor
-
-  !> Take the FIRST extension step of an axis from anchor element `anc`,
-  !! preferring `pos_slot` but falling back to `neg_slot` (the same
-  !! axis's opposite direction) if the positive side is blocked (a
-  !! boundary, or a neighbor already claimed by an earlier-processed
-  !! brick). Only the first step of an axis needs this: every step after
-  !! it already self-corrects via step_neighbor's returned next_slot, so
-  !! whichever direction wins here is simply followed from then on.
-  !!
-  !! Without this, a seed/branch-point whose "positive" neighbor happens
-  !! to have been claimed by an earlier brick becomes a needless
-  !! singleton even when its "negative" side was wide open -- confirmed
-  !! empirically to be the dominant cause of small aggregates on
-  !! less-regular meshes (most singletons were blocked by an
-  !! already-claimed neighbor, not a real boundary). ok=.false. only if
-  !! BOTH directions are blocked, same as today's shrink behavior.
-  subroutine first_step(mmsh, elm_loc_face, part, anc, pos_slot, neg_slot, &
-       next_e, next_slot, ok)
-    type(macro_mesh_t), intent(in) :: mmsh
-    integer(i4), intent(in) :: elm_loc_face(:,:)
-    integer(i4), intent(in) :: part(:)
-    integer(i4), intent(in) :: anc, pos_slot, neg_slot
-    integer(i4), intent(out) :: next_e, next_slot
-    logical, intent(out) :: ok
-
-    call step_neighbor(mmsh, elm_loc_face, anc, pos_slot, next_e, next_slot)
-    if (next_e .ne. 0) then
-       if (part(next_e) .eq. 0) then
-          ok = .true.
-          return
-       end if
-    end if
-    call step_neighbor(mmsh, elm_loc_face, anc, neg_slot, next_e, next_slot)
-    if (next_e .ne. 0) then
-       if (part(next_e) .eq. 0) then
-          ok = .true.
-          return
-       end if
-    end if
-    ok = .false.
-    next_e = 0; next_slot = 0
-  end subroutine first_step
-
-  !> Attempt to grow one (up to) k1 x k2 x k3 logical brick from seed s:
-  !! walk axis 1 up to k1-1 steps to build a spine; from EACH spine-1
-  !! element, branch a fresh axis-2 walk up to k2-1 steps; from EACH
-  !! resulting element, branch a fresh axis-3 walk up to k3-1 steps.
-  !!
-  !! Each axis's FIRST extension step (from the seed for axis 1, from
-  !! each newly-reached axis-1 element for axis 2, from each
-  !! newly-reached axis-2 element for axis 3) tries slot 2/4/6 (+x/+y/+z)
-  !! first but falls back to slot 1/3/5 (-x/-y/-z) via first_step if that
-  !! direction is blocked -- see first_step's header for why: a seed
-  !! whose "positive" neighbor was already claimed by an earlier brick
-  !! would otherwise become a needless singleton even when its negative
-  !! side was open. EVERY step after that first one per axis is fully
-  !! self-correcting (step_neighbor re-discovers direction every hop) and
-  !! simply follows whichever direction first_step committed to.
-  !!
-  !! The one real assumption is at each branch point, where a fresh
-  !! axis's starting slot pair (2/1, or 4/3, or 6/5) is trusted to mean
-  !! the same physical direction as it did at the seed -- true on a
-  !! genuinely locally-structured mesh patch, and exactly what the
-  !! duplicate check below catches a violation of.
-  !!
-  !! Shrinks per-axis extent when NEITHER direction is available (a
-  !! physical boundary on both sides, or both neighbors already claimed)
-  !! -- never a failure, just a smaller (still flat-faced) brick, most
-  !! common near domain boundaries. Aborts (n=0) if the walk ever
-  !! revisits an element already placed in THIS brick -- the cheap safety
-  !! valve for the branch-point assumption above; on abort, every
-  !! candidate element simply falls through to the ordinary greedy growth
-  !! in agglomerate_level, so a failed brick never corrupts `part`.
-  subroutine grow_brick(mmsh, elm_loc_face, part, s, k1, k2, k3, elems, n)
-    type(macro_mesh_t), intent(in) :: mmsh
-    integer(i4), intent(in) :: elm_loc_face(:,:)
-    integer(i4), intent(in) :: part(:)
-    integer(i4), intent(in) :: s, k1, k2, k3
-    integer(i4), intent(out) :: elems(:)   !< caller-sized >= k1*k2*k3
-    integer(i4), intent(out) :: n
-    integer(i4) :: p1, p2, p3, slot1, slot2, slot3, next_e, next_slot
-    integer(i4) :: i1, i2, i3, m
-    logical :: ok
-
-    n = 0
-    p1 = s; slot1 = 2
-    do i1 = 1, k1
-       if (i1 .gt. 1) then
-          if (i1 .eq. 2) then
-             call first_step(mmsh, elm_loc_face, part, p1, 2, 1, &
-                  next_e, next_slot, ok)
-             if (.not. ok) exit
-          else
-             call step_neighbor(mmsh, elm_loc_face, p1, slot1, next_e, next_slot)
-             if (next_e .eq. 0) exit
-             if (part(next_e) .ne. 0) exit
-          end if
-          p1 = next_e; slot1 = next_slot
-       end if
-       p2 = p1; slot2 = 4
-       do i2 = 1, k2
-          if (i2 .gt. 1) then
-             if (i2 .eq. 2) then
-                call first_step(mmsh, elm_loc_face, part, p2, 4, 3, &
-                     next_e, next_slot, ok)
-                if (.not. ok) exit
-             else
-                call step_neighbor(mmsh, elm_loc_face, p2, slot2, next_e, next_slot)
-                if (next_e .eq. 0) exit
-                if (part(next_e) .ne. 0) exit
-             end if
-             p2 = next_e; slot2 = next_slot
-          end if
-          p3 = p2; slot3 = 6
-          do i3 = 1, k3
-             if (i3 .gt. 1) then
-                if (i3 .eq. 2) then
-                   call first_step(mmsh, elm_loc_face, part, p3, 6, 5, &
-                        next_e, next_slot, ok)
-                   if (.not. ok) exit
-                else
-                   call step_neighbor(mmsh, elm_loc_face, p3, slot3, next_e, next_slot)
-                   if (next_e .eq. 0) exit
-                   if (part(next_e) .ne. 0) exit
-                end if
-                p3 = next_e; slot3 = next_slot
-             end if
-             do m = 1, n
-                if (elems(m) .eq. p3) then
-                   n = 0
-                   return
-                end if
-             end do
-             n = n + 1
-             elems(n) = p3
-          end do
-       end do
-    end do
-  end subroutine grow_brick
 
   !> One coarsening step: lvl + part -> coarse level lvlC + transfer tr
   !! (extracted topology returned too). Steps: extract macroentities;
@@ -690,24 +683,6 @@ contains
     if (lvlC%mmsh%n_verts .ne. nmv) then
        call neko_error('coarsen_level_3d: coarse mesh vertex count ' // &
             'disagrees with the transfer''s n_coarse')
-    end if
-
-    ! Recurse brick growth: derive elm_loc_face for the NEW coarse level
-    ! (works whether lvlC%mmsh came from the ghosted or plain branch above,
-    ! since both populate the same generic face_el/face_nel/face_vtx_ptr/
-    ! face_edge_ptr fields). agglomerate_bricks_pass activates on this
-    ! level's own next agglomerate_level call purely because the table is
-    ! now allocated -- no other wiring needed (see amge_coarsen.f90's
-    ! agglomerate_bricks_pass header).
-    call derive_elm_loc_face(lvlC%mmsh)
-    if (AMGE_DEBUG_CHECKS) then
-       block
-         integer(i4) :: n_elig
-         n_elig = count(lvlC%mmsh%elm_loc_face(1, :) .ne. 0)
-         write(*, '("   [check] rank ", I0, ": brick-eligible: ", I0, "/", &
-              & I0, " elements have a clean 6-quad-face structure")') &
-              pe_rank, n_elig, lvlC%mmsh%n_elem
-       end block
     end if
 
     allocate(lvlC%elm_vtx_ptr(n_macro + 1), lvlC%AM(n_macro))
