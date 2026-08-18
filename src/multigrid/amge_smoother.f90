@@ -33,7 +33,7 @@ module amge_smoother
   use amge_level, only : amge_level_t, amge_vec_t, amge_apply
   use amge_utils, only : scale_by_valence
   use num_types, only : i4, rp
-  use math, only : glsc3, sub2, cmult2, copy
+  use math, only : glsc3, sub2, cmult2, copy, add2
   use utils, only : neko_error
   use logger, only : neko_log, LOG_SIZE
   implicit none
@@ -41,6 +41,12 @@ module amge_smoother
 
   integer, public, parameter :: AMGE_SMOOTHER_CHEBY = 1
   integer, public, parameter :: AMGE_SMOOTHER_JACOBI = 2
+  !> l1-Jacobi-preconditioned (a.k.a. l1-Jacobi-accelerated, or "scaled")
+  !! Chebyshev: same amge_cheby_t type and 3-term recurrence, but both the
+  !! eigenvalue estimate and the recurrence itself act on M^{-1}A (M =
+  !! diag(lvl%dl1), the existing l1 diagonal) instead of raw A -- see
+  !! amge_cheby_t%use_l1_precond.
+  integer, public, parameter :: AMGE_SMOOTHER_CHEBY_L1JACOBI = 3
 
   !> Abstract per-level AMGe smoother. lvl/max_iter are common to every
   !! concrete smoother; init/solve/free are the shared interface
@@ -91,12 +97,18 @@ module amge_smoother
      class(amge_smoother_t), allocatable :: obj
   end type amge_smoother_wrapper_t
 
-  !> Chebyshev iteration smoother for one AMGe level.
+  !> Chebyshev iteration smoother for one AMGe level. When
+  !! use_l1_precond is set (see AMGE_SMOOTHER_CHEBY_L1JACOBI), both the
+  !! eigenvalue estimate (amge_cheby_power) and the recurrence
+  !! (amge_cheby_solve) act on the l1-Jacobi-preconditioned operator
+  !! M^{-1}A instead of raw A -- z is the scratch vector that holds the
+  !! preconditioned residual in that mode.
   type, public, extends(amge_smoother_t) :: amge_cheby_t
-     type(amge_vec_t) :: d, w, r
+     type(amge_vec_t) :: d, w, r, z
      real(kind=rp) :: tha, dlt
      integer :: power_its = 250
      logical :: recompute_eigs = .true.
+     logical :: use_l1_precond = .false.
    contains
      procedure, pass(this) :: init => amge_cheby_init
      procedure, pass(this) :: solve => amge_cheby_solve
@@ -122,6 +134,9 @@ contains
   !> Allocate obj to the concrete smoother type named by kind (one of
   !! the AMGE_SMOOTHER_* parameters). Centralizes the type <-> kind
   !! mapping so callers (amge_hierarchy_init) just pick a kind per level.
+  !! AMGE_SMOOTHER_CHEBY_L1JACOBI allocates the SAME amge_cheby_t as
+  !! AMGE_SMOOTHER_CHEBY, just with use_l1_precond set -- see that type's
+  !! header for what changes.
   subroutine amge_smoother_alloc(obj, kind)
     class(amge_smoother_t), allocatable, intent(inout) :: obj
     integer, intent(in) :: kind
@@ -129,6 +144,12 @@ contains
     select case (kind)
     case (AMGE_SMOOTHER_CHEBY)
        allocate(amge_cheby_t :: obj)
+    case (AMGE_SMOOTHER_CHEBY_L1JACOBI)
+       allocate(amge_cheby_t :: obj)
+       select type (obj)
+       type is (amge_cheby_t)
+          obj%use_l1_precond = .true.
+       end select
     case (AMGE_SMOOTHER_JACOBI)
        allocate(amge_jacobi_t :: obj)
     case default
@@ -152,11 +173,16 @@ contains
     call lvl_obj%new_vec(this%d)
     call lvl_obj%new_vec(this%w)
     call lvl_obj%new_vec(this%r)
+    call lvl_obj%new_vec(this%z)
     this%lvl = lvl
     this%max_iter = max_iter
     this%recompute_eigs = .true.
 
-    call amge_smoo_monitor(lvl, max_iter, 'Chebyshev')
+    if (this%use_l1_precond) then
+       call amge_smoo_monitor(lvl, max_iter, 'Chebyshev (l1-Jacobi preconditioned)')
+    else
+       call amge_smoo_monitor(lvl, max_iter, 'Chebyshev')
+    end if
   end subroutine amge_cheby_init
 
   !> Free cheby data
@@ -165,6 +191,7 @@ contains
     call this%d%free()
     call this%w%free()
     call this%r%free()
+    call this%z%free()
   end subroutine amge_cheby_free
 
   !> The assembled action of this level's operator: amge_apply's
@@ -216,14 +243,18 @@ contains
       ! gs_h%op on its level-0 initial vector)
       call lvl_obj%gsh%op(d%x)
 
-      ! Power method to get lambda max
+      ! Power method to get lambda max (of M^{-1}A when use_l1_precond,
+      ! else of raw A -- apply_l1_inv scales w in place right after each
+      ! matvec, so every use of w below already reflects M^{-1}A's action)
       do i = 1, this%power_its
          call amge_cheby_matvec(lvl_obj, d, w)
+         if (this%use_l1_precond) call apply_l1_inv(lvl_obj, w)
          wtw = glsc3(w%x, lvl_obj%mult, w%x, n)
          call cmult2(d%x, w%x, 1.0_rp / sqrt(wtw), n)
       end do
 
       call amge_cheby_matvec(lvl_obj, d, w)
+      if (this%use_l1_precond) call apply_l1_inv(lvl_obj, w)
       dtw = glsc3(d%x, lvl_obj%mult, w%x, n)
       dtd = glsc3(d%x, lvl_obj%mult, d%x, n)
       lam = dtw / dtd
@@ -261,7 +292,7 @@ contains
     max_iter = this%max_iter
     n = x%n_dofs
 
-    associate(w => this%w, r => this%r, d => this%d)
+    associate(w => this%w, r => this%r, d => this%d, z => this%z)
       call copy(r%x, f%x, n)
       if (.not. zero_initial_guess) then
          call amge_cheby_matvec(lvl_obj, x, w)
@@ -273,14 +304,18 @@ contains
       s1 = thet / delt
       rhok = 1.0_rp / s1
 
-      ! First iteration
+      ! First iteration. z is the preconditioned residual M^{-1}r when
+      ! use_l1_precond (M = diag(lvl%dl1)), else just r itself -- the
+      ! d-update below always reads z, so this is the only branch point.
+      call copy(z%x, r%x, n)
+      if (this%use_l1_precond) call apply_l1_inv(lvl_obj, z)
       !OCL NORECURRENCE, NOVREC, NOALIAS
       !DIR$ CONCURRENT
       !DIR$ IVDEP
       !GCC$ ivdep
       !$omp parallel do
       do i = 1, n
-         d%x(i) = 1.0_rp / thet * r%x(i)
+         d%x(i) = 1.0_rp / thet * z%x(i)
          x%x(i) = x%x(i) + d%x(i)
       end do
       !$omp end parallel do
@@ -294,6 +329,23 @@ contains
          tmp2 = 2.0_rp * rhokp1 / delt
          rhok = rhokp1
 
+         !OCL NORECURRENCE, NOVREC, NOALIAS
+         !DIR$ CONCURRENT
+         !DIR$ IVDEP
+         !GCC$ ivdep
+         !$omp parallel do
+         do i = 1, n
+            r%x(i) = r%x(i) - w%x(i)
+         end do
+         !$omp end parallel do
+
+         ! z = M^{-1}r (or just r): needs its own pass, not fusable into
+         ! the flat i-loops above/below -- apply_l1_inv locates each
+         ! dof's l1 diagonal via elm_vtx_idx, which requires walking
+         ! elements/local dofs (elm_vtx_ptr/ndof_el), not a flat index.
+         call copy(z%x, r%x, n)
+         if (this%use_l1_precond) call apply_l1_inv(lvl_obj, z)
+
          !$omp parallel private(i)
          !OCL NORECURRENCE, NOVREC, NOALIAS
          !DIR$ CONCURRENT
@@ -301,8 +353,7 @@ contains
          !GCC$ ivdep
          !$omp do
          do i = 1, n
-            r%x(i) = r%x(i) - w%x(i)
-            d%x(i) = tmp1 * d%x(i) + tmp2 * r%x(i)
+            d%x(i) = tmp1 * d%x(i) + tmp2 * z%x(i)
             x%x(i) = x%x(i) + d%x(i)
          end do
          !$omp end do
@@ -310,6 +361,29 @@ contains
       end do
     end associate
   end subroutine amge_cheby_solve
+
+  !> Divide v in place by the l1 diagonal (lvl_obj%dl1), dof by dof, via
+  !! elm_vtx_idx -- the flat cell-wise index (off+p) is the same index
+  !! space dl1 lookups need to go through elm_vtx_idx to resolve, so this
+  !! needs its own element/local-dof walk rather than a flat loop.
+  !! Skips a dof whose l1 diagonal is exactly zero (matches
+  !! amge_jacobi_solve's existing guard -- e.g. an isolated Dirichlet dof
+  !! whose row was fully decoupled, see amge_utils.f90's
+  !! amge_fill_AM_from_ax).
+  subroutine apply_l1_inv(lvl_obj, v)
+    type(amge_level_t), intent(in) :: lvl_obj
+    type(amge_vec_t), intent(inout) :: v
+    integer(i4) :: e, p, off
+
+    do e = 1, lvl_obj%nelm()
+       off = lvl_obj%elm_vtx_ptr(e)
+       do p = 1, lvl_obj%ndof_el(e)
+          if (abs(lvl_obj%dl1(lvl_obj%elm_vtx_idx(off + p))) > 0) then
+             v%x(off + p) = v%x(off + p) / lvl_obj%dl1(lvl_obj%elm_vtx_idx(off + p))
+          end if
+       end do
+    end do
+  end subroutine apply_l1_inv
 
   ! ================== l1-Jacobi ==================
 
@@ -342,22 +416,16 @@ contains
     type(amge_vec_t), intent(inout) :: x
     type(amge_vec_t), intent(in) :: f
     logical, optional, intent(in) :: zero_init
-    integer(i4) :: it, e, p, off
+    integer(i4) :: it, n
 
+    n = x%n_dofs
     associate(rt => this%r)
       do it = 1, this%max_iter
          call amge_apply(lvl_obj, x, rt)
          call lvl_obj%gsh%op(rt%x)
          rt%x = f%x - rt%x
-         do e = 1, lvl_obj%nelm()
-            off = lvl_obj%elm_vtx_ptr(e)
-            do p = 1, lvl_obj%ndof_el(e)
-               if (abs(lvl_obj%dl1(lvl_obj%elm_vtx_idx(off + p))) > 0) then
-                  x%x(off + p) = x%x(off + p) + &
-                       rt%x(off + p) / lvl_obj%dl1(lvl_obj%elm_vtx_idx(off + p))
-               end if
-            end do
-         end do
+         call apply_l1_inv(lvl_obj, rt)
+         call add2(x%x, rt%x, n)
          call lvl_obj%gsh%op(x%x)
          call scale_by_valence(lvl_obj, x)
       end do
