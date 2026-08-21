@@ -78,6 +78,15 @@ module amge_coarsen
   !! this (see amge_nice_shape_min_touch).
   real(rp), public :: amge_overgrow_factor = 2.0_rp
 
+  !> Hard cap on the number of DISTINCT already-finished neighbors a
+  !! single growing macroelement will snap-absorb a face patch from (see
+  !! greedy_grow_from_seedset's header) -- not a cap on absorbed element
+  !! count, which stays uncapped per neighbor once snapped into. Prevents
+  !! an extended seam of thin neighbors from being zippered through one
+  !! bite at a time; 3 mirrors the routine's own motivating "wedged
+  !! against 3 faces" scenario.
+  integer(i4), public :: amge_max_snap_neighbors = 3
+
   !> Running worst-case diagnostics accumulated across a level's
   !! macroelements by schur_extend, verifying eq.(48)-(53) of the AMGe
   !! theory note (see [[amge_theory_reference]]): symmetry of S_dM (52),
@@ -301,12 +310,23 @@ contains
   !! slot_toward, and absorb EVERY still-unassigned far-side element of
   !! that patch, unconditionally -- a partial face match would defeat
   !! the whole point of snapping to it, so this has no target_size cap
-  !! at all; the only bound is face_patch's own patch_cap safety valve
-  !! -- then scan their own neighbors too, via `worklist` (so absorption
-  !! can cascade: a snapped-in element may itself bump into yet another
-  !! macroelement). An element that turns out to already belong to a
-  !! THIRD macroelement at a genuine 3-way junction is simply left alone
-  !! -- an unavoidable corner, not a bug.
+  !! at all; the only per-neighbor bound is face_patch's own patch_cap
+  !! safety valve -- then scan their own neighbors too, via `worklist`
+  !! (so absorption can cascade: a snapped-in element may itself bump
+  !! into yet another macroelement). An element that turns out to
+  !! already belong to a THIRD macroelement at a genuine 3-way junction
+  !! is simply left alone -- an unavoidable corner, not a bug.
+  !!
+  !! Separately, the NUMBER OF DISTINCT neighbors snapped into (as
+  !! opposed to elements absorbed per neighbor) IS capped, at
+  !! amge_max_snap_neighbors: without this, a growing macroelement
+  !! sitting along an extended seam of thin already-finished neighbors
+  !! can zipper through dozens of them, one small bite at a time, wildly
+  !! overshooting target_size (observed: 103 elements from 34 distinct
+  !! neighbors on one case). A repeat bump into an already-snapped
+  !! neighbor doesn't count against this cap -- only encountering a new
+  !! one after the cap is reached is skipped, leaving that neighbor's
+  !! patch with its current owner.
   !!
   !! The ordinary bscore competition, in contrast, treats target_size as
   !! a WEAK bound: once cnt reaches target_size, the best remaining
@@ -334,8 +354,9 @@ contains
     integer(i4), intent(out) :: cnt
     integer(i4), allocatable :: frontier(:)
     logical, allocatable :: infr(:)
+    logical, allocatable :: snapped(:)
     integer(i4) :: ne, nfr, best, bscore, sc, a, q, e, c, si, hard_max
-    integer(i4) :: wn, wi, v, dslot, npatch, k
+    integer(i4) :: wn, wi, v, dslot, npatch, k, n_snapped
     logical :: use_faces
 
     ne = lvl%mmsh%n_elem
@@ -347,6 +368,7 @@ contains
     nfr = 0
     cnt = 0
     wn = 0
+    allocate(snapped(ne)); snapped = .false.; n_snapped = 0
 
     do si = 1, n_seed
        part(seed_set(si)) = new_id
@@ -365,6 +387,17 @@ contains
                    nfr = nfr + 1; frontier(nfr) = e; infr(e) = .true.
                 end if
              else if (use_faces .and. part(e) .ne. new_id) then
+                ! cap the number of DISTINCT neighbors we'll snap into
+                ! (amge_max_snap_neighbors) -- a repeat bump into a
+                ! neighbor already snapped is unaffected (still folds in
+                ! its whole patch, uncapped in element count); only a
+                ! genuinely new neighbor past the cap is skipped, leaving
+                ! its patch with its current owner.
+                if (.not. snapped(part(e))) then
+                   if (n_snapped .ge. amge_max_snap_neighbors) cycle
+                   snapped(part(e)) = .true.
+                   n_snapped = n_snapped + 1
+                end if
                 dslot = slot_toward(lvl%mmsh, lvl%mmsh%elm_loc_face, e, v)
                 if (dslot .eq. 0) cycle
                 call face_patch(lvl%mmsh, lvl%mmsh%elm_loc_face, part, e, &
