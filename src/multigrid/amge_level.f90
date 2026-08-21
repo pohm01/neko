@@ -205,6 +205,14 @@ contains
                + sum(abs(lvl%AM(e)%x(i, :)))
        end do
     end do
+    ! d is a per-UNIQUE-vertex row sum, exact from local elements alone
+    ! everywhere except at a rank-shared vertex, where each rank has only
+    ! summed its OWN incident elements -- correct those to the true
+    ! cross-rank total (same tool amge_coarsen.f90 uses for the analogous
+    ! per-vertex membership count), or the l1-Jacobi preconditioner is
+    ! smaller than it should be at every rank boundary, inflating the
+    ! Chebyshev eigenvalue estimate there.
+    call lvl%gsh%correct_shared_count(lvl%elm_vtx_idx, d)
   end subroutine amge_setup_l1_diag
 
   ! ================== housekeeping ==================
