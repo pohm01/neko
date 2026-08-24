@@ -651,8 +651,10 @@ contains
     integer(i4), allocatable :: part_ext(:)
     integer(i4), allocatable :: p_vtx_ptr(:), p_vtx_idx(:)
     integer(i4), allocatable :: p_face_ptr(:), p_fv_ptr(:), p_fv_idx(:)
+    integer(i4), allocatable :: p_face_anchor(:,:)
     integer(i4), allocatable :: p_fe_ptr(:)
     integer(i4), allocatable :: p_fe_vtx(:,:)
+    integer(i4), allocatable :: p_fe_anchor(:,:)
     integer(i4), allocatable :: p_amat_ptr(:)
     real(rp), allocatable :: p_amat(:)
     integer(i4), allocatable :: g2l_ext(:)
@@ -668,11 +670,11 @@ contains
        ! extraction sees a complete neighborhood at every rank-boundary
        ! entity -- see amge_ghost.f90 for the rationale.
        call build_ghost_payload_local(lvl, p_vtx_ptr, p_vtx_idx, &
-            p_face_ptr, p_fv_ptr, p_fv_idx, p_fe_ptr, p_fe_vtx, &
-            p_amat_ptr, p_amat)
+            p_face_ptr, p_fv_ptr, p_fv_idx, p_face_anchor, p_fe_ptr, &
+            p_fe_vtx, p_fe_anchor, p_amat_ptr, p_amat)
        call amge_ghost_exchange(NEKO_COMM%mpi_val, p_vtx_ptr, p_vtx_idx, &
-            p_face_ptr, p_fv_ptr, p_fv_idx, p_fe_ptr, p_fe_vtx, &
-            p_amat_ptr, p_amat, part, n_macro, gh)
+            p_face_ptr, p_fv_ptr, p_fv_idx, p_face_anchor, p_fe_ptr, &
+            p_fe_vtx, p_fe_anchor, p_amat_ptr, p_amat, part, n_macro, gh)
        call amge_ghost_part_ext(gh, part, part_ext)
        moff = gh%macro_offset
        n_macro_topo = gh%n_macro_global
@@ -683,7 +685,8 @@ contains
        ! amge_ghost.f90's header and macro_mesh_splice_ghost's doc comment)
        call macro_mesh_splice_ghost(lvl%mmsh, gh%n_ghost, gh%vtx_ptr, &
             gh%vtx_idx, gh%face_ptr, gh%face_vtx_ptr, gh%face_vtx_idx, &
-            gh%face_edge_ptr, gh%face_edge_vtx, lvl_ext%mmsh)
+            gh%face_anchor, gh%face_edge_ptr, gh%face_edge_vtx, &
+            gh%face_edge_anchor, lvl_ext%mmsh)
 
        ! lvl_ext's elm_vtx_ptr/idx + AM: local elements keep their own
        ! (unchanged local numbering, since macro_mesh_splice_ghost leaves
@@ -902,14 +905,16 @@ contains
   !! reported once per element (harmless duplication: the receiver dedups
   !! purely by vertex-set identity, see macro_mesh_splice_ghost).
   subroutine build_ghost_payload_local(lvl, vtx_ptr, vtx_idx, &
-       face_ptr, face_vtx_ptr, face_vtx_idx, face_edge_ptr, face_edge_vtx, &
-       amat_ptr, amat)
+       face_ptr, face_vtx_ptr, face_vtx_idx, face_anchor, face_edge_ptr, &
+       face_edge_vtx, face_edge_anchor, amat_ptr, amat)
     type(amge_level_t), intent(in) :: lvl
     integer(i4), allocatable, intent(out) :: vtx_ptr(:), vtx_idx(:)
     integer(i4), allocatable, intent(out) :: face_ptr(:), face_vtx_ptr(:)
     integer(i4), allocatable, intent(out) :: face_vtx_idx(:)
+    integer(i4), allocatable, intent(out) :: face_anchor(:,:)
     integer(i4), allocatable, intent(out) :: face_edge_ptr(:)
     integer(i4), allocatable, intent(out) :: face_edge_vtx(:,:)
+    integer(i4), allocatable, intent(out) :: face_edge_anchor(:,:)
     integer(i4), allocatable, intent(out) :: amat_ptr(:)
     real(rp), allocatable, intent(out) :: amat(:)
     integer(i4), allocatable :: eface_ptr(:), eface_idx(:)
@@ -944,7 +949,9 @@ contains
        end do
     end do
     allocate(face_vtx_idx(face_vtx_ptr(face_ptr(nelv + 1) + 1)))
+    allocate(face_anchor(4, face_ptr(nelv + 1)))
     allocate(face_edge_vtx(2, face_edge_ptr(face_ptr(nelv + 1) + 1)))
+    allocate(face_edge_anchor(2, face_edge_ptr(face_ptr(nelv + 1) + 1)))
 
     slot = 0
     do e = 1, nelv
@@ -957,6 +964,7 @@ contains
        do a = eface_ptr(e) + 1, eface_ptr(e + 1)
           f = eface_idx(a)
           slot = slot + 1
+          face_anchor(:, slot) = lvl%mmsh%face_anchor(:, f)
           do k = 1, lvl%mmsh%face_vtx_ptr(f + 1) - lvl%mmsh%face_vtx_ptr(f)
              face_vtx_idx(face_vtx_ptr(slot) + k) = lvl%mmsh%vert_id( &
                   lvl%mmsh%face_vtx_idx(lvl%mmsh%face_vtx_ptr(f) + k))
@@ -967,6 +975,7 @@ contains
                   lvl%mmsh%vert_id(lvl%mmsh%edge_vtx(1, g))
              face_edge_vtx(2, face_edge_ptr(slot) + k) = &
                   lvl%mmsh%vert_id(lvl%mmsh%edge_vtx(2, g))
+             face_edge_anchor(:, face_edge_ptr(slot) + k) = lvl%mmsh%edge_anchor(:, g)
           end do
        end do
     end do

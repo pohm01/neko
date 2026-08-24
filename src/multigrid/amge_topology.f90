@@ -90,6 +90,10 @@ module amge_topology
   type :: macro_edge_t
      integer(i4), allocatable :: chain(:)     !< vertex chain (local ids)
      integer(i4), allocatable :: edge_ids(:)  !< fine edge indices along it
+     !> Lineage identity: the lexicographically smallest level-0 edge
+     !! (sorted GLOBAL vertex pair) ever merged into this macroedge. See
+     !! macro_mesh_t%edge_anchor for why this exists.
+     integer(i4) :: anchor(2) = 0
   end type macro_edge_t
 
   !> A macroface: a connected same-label patch of exposed facets.
@@ -98,6 +102,10 @@ module amge_topology
      integer(i4), allocatable :: verts(:)     !< unique vertex set (local ids)
      integer(i4), allocatable :: bnd_medge(:) !< bounding macroedge indices
      integer(i4) :: label(2)                  !< sorted macro pair, 0=exterior
+     !> Lineage identity: the lexicographically smallest level-0 facet
+     !! (sorted GLOBAL vertex quad) ever merged into this macroface. See
+     !! macro_mesh_t%face_anchor for why this exists.
+     integer(i4) :: anchor(4) = 0
   end type macro_face_t
 
   !> Generic per-level entity tables: what init_tables consumes and what
@@ -115,6 +123,22 @@ module amge_topology
      integer(i4), allocatable :: edge_vtx(:,:)    !< (2, n_edge)
      integer(i4), allocatable :: face_el(:,:)     !< (2, n_face) incident elems
      integer(i4), allocatable :: face_nel(:)      !< 1 or 2
+     !> (4, n_face)/(2, n_edge): lineage identity, the lexicographically
+     !! smallest level-0 facet/edge (sorted GLOBAL vertex ids) ever merged
+     !! into this face/edge. A face/edge's OWN vertex set erodes as
+     !! coarsening keeps fewer macrovertices, to the point that two
+     !! unrelated faces/edges can end up bounded by the identical
+     !! (eroded) vertex set -- but level-0 identity never erodes (a hex
+     !! facet/edge is unambiguous by construction), and the union-find
+     !! that builds macrofaces/macroedges always partitions facets/edges
+     !! into disjoint groups, so the anchor (unlike the corner-vertex
+     !! set) is guaranteed unique per face/edge, at every level, on every
+     !! rank consistently (it's a pure function of global vertex ids, no
+     !! cross-rank negotiation needed). This is what
+     !! macro_mesh_splice_ghost matches ghost entities against, instead
+     !! of the eroding vertex set.
+     integer(i4), allocatable :: face_anchor(:,:) !< (4, n_face)
+     integer(i4), allocatable :: edge_anchor(:,:) !< (2, n_edge)
      !> (6, n_elem) global face id per local face slot, in fixed loc_face
      !! order (1,2=-x/+x, 3,4=-y/+y, 5,6=-z/+z). Only populated by
      !! macro_mesh_init_hex (level 0, true hexes with a fixed reference
@@ -163,29 +187,6 @@ module amge_topology
      integer(i4) :: n = 0
   end type tuple_map_t
 
-  !> One slot of a vset_map_t: a sorted, variable-length vertex-id key.
-  !! Unallocated %v marks an empty slot.
-  type :: vset_key_t
-     integer(i4), allocatable :: v(:)
-  end type vset_key_t
-
-  !> Sorted-vertex-set -> value map. Unlike tuple_map_t (capped at 4 keys,
-  !! enough for a hex's quad facets), a macroface above level 0 can have
-  !! arbitrarily many vertices (a coplanar run of many fine facets), so
-  !! this variant stores variable-length keys and compares them in full
-  !! on collision. Used only by macro_mesh_splice_ghost to identify a
-  !! ghost element's face against the local mesh's own faces (or another
-  !! ghost element's face already spliced in this same pass) purely by
-  !! vertex-set identity -- the only identity a macroface has above level
-  !! 0, since its facet/edge structure is inherited, not derivable from
-  !! its vertex set via any fixed template.
-  type :: vset_map_t
-     type(vset_key_t), allocatable :: keys(:)
-     integer(i4), allocatable :: val(:)
-     integer(i4) :: cap = 0
-     integer(i4) :: n = 0
-  end type vset_map_t
-
   ! Reference-hex local facets and edges, in NEKO hex_t vertex ordering
   ! (src/mesh/hex.f90). Vertices are numbered lexicographically within
   ! the cell: x fastest, then y, then z, so in symmetric coordinates
@@ -232,10 +233,11 @@ contains
     call tmap_init(emap, 32 * nelv)
     call tmap_init(fmap, 16 * nelv)
     allocate(lverts(8, nelv))
-    allocate(mmsh%edge_vtx(2, 12 * nelv))
+    allocate(mmsh%edge_vtx(2, 12 * nelv), mmsh%edge_anchor(2, 12 * nelv))
     allocate(mmsh%face_vtx_ptr(6 * nelv + 1), mmsh%face_vtx_idx(4 * 6 * nelv))
     allocate(mmsh%face_edge_ptr(6 * nelv + 1), mmsh%face_edge_idx(4 * 6 * nelv))
     allocate(mmsh%face_el(2, 6 * nelv), mmsh%face_nel(6 * nelv))
+    allocate(mmsh%face_anchor(4, 6 * nelv))
     allocate(mmsh%elm_loc_face(6, nelv))
     allocate(mmsh%vert_id(8 * nelv))
     mmsh%face_nel = 0
@@ -261,6 +263,10 @@ contains
           if (g .eq. ne + 1) then
              ne = g
              mmsh%edge_vtx(:, g) = pr
+             ! anchor: this level-0 edge's OWN sorted global vertex pair --
+             ! unambiguous by construction, never eroded (see edge_anchor)
+             mmsh%edge_anchor(:, g) = mmsh%vert_id(pr)
+             call sort2(mmsh%edge_anchor(:, g))
           end if
        end do
        do t = 1, 6
@@ -270,6 +276,11 @@ contains
           call tmap_find_or_add(fmap, key, nf + 1, f)
           if (f .eq. nf + 1) then
              nf = f
+             ! anchor: this level-0 facet's OWN sorted global vertex quad
+             ! -- unambiguous by construction, never eroded (see
+             ! face_anchor)
+             mmsh%face_anchor(:, f) = mmsh%vert_id(cyc)
+             call sort4(mmsh%face_anchor(:, f))
              mmsh%face_vtx_ptr(f + 1) = mmsh%face_vtx_ptr(f) + 4
              mmsh%face_edge_ptr(f + 1) = mmsh%face_edge_ptr(f) + 4
              do q = 1, 4
@@ -557,6 +568,7 @@ contains
             allocate(me%chain(tclen), me%edge_ids(telen))
             me%chain = tmp_chain(1:tclen)
             me%edge_ids = tmp_eids(1:telen)
+            call min_anchor(mmsh%edge_anchor, me%edge_ids, 2, me%anchor)
           end associate
           edge2me(tmp_eids(1:telen)) = this%n_medge
        end do
@@ -615,6 +627,7 @@ contains
             mf%facet_ids(cnt) = f
             mf%label = face_lab(:, f)
          end do
+         call min_anchor(mmsh%face_anchor, mf%facet_ids, 4, mf%anchor)
          cnt = 0
          do a = 1, size(mf%facet_ids)
             f = mf%facet_ids(a)
@@ -735,13 +748,16 @@ contains
        end if
     end do
     allocate(mmshC%edge_vtx(2, max(this%n_medge, 1)))
+    allocate(mmshC%edge_anchor(2, max(this%n_medge, 1)))
     do k = 1, this%n_medge
        associate (ch => this%medge(k)%chain)
          mmshC%edge_vtx(1, k) = min(cidx(ch(1)), cidx(ch(size(ch))))
          mmshC%edge_vtx(2, k) = max(cidx(ch(1)), cidx(ch(size(ch))))
        end associate
+       mmshC%edge_anchor(:, k) = this%medge(k)%anchor
     end do
     allocate(mmshC%face_el(2, max(this%n_mface, 1)), mmshC%face_nel(max(this%n_mface, 1)))
+    allocate(mmshC%face_anchor(4, max(this%n_mface, 1)))
     allocate(mmshC%face_vtx_ptr(this%n_mface + 1), mmshC%face_edge_ptr(this%n_mface + 1))
     mmshC%face_vtx_ptr(1) = 0
     mmshC%face_edge_ptr(1) = 0
@@ -753,6 +769,7 @@ contains
        mmshC%face_vtx_ptr(k + 1) = mmshC%face_vtx_ptr(k) + cnt
        mmshC%face_edge_ptr(k + 1) = mmshC%face_edge_ptr(k) + size(this%mface(k)%bnd_medge)
        mmshC%face_nel(k) = 0
+       mmshC%face_anchor(:, k) = this%mface(k)%anchor
        do a = 1, 2
           if (this%mface(k)%label(a) .gt. 0) then
              mmshC%face_nel(k) = mmshC%face_nel(k) + 1
@@ -900,18 +917,22 @@ contains
     end do
 
     allocate(mmshC%edge_vtx(2, max(mmshC%n_edge, 1)))
+    allocate(mmshC%edge_anchor(2, max(mmshC%n_edge, 1)))
     do k = 1, this%n_medge
        if (.not. edge_keep(k)) cycle
        associate (ch => this%medge(k)%chain)
          mmshC%edge_vtx(1, eidx(k)) = min(cidx(ch(1)), cidx(ch(size(ch))))
          mmshC%edge_vtx(2, eidx(k)) = max(cidx(ch(1)), cidx(ch(size(ch))))
        end associate
+       mmshC%edge_anchor(:, eidx(k)) = this%medge(k)%anchor
     end do
 
     allocate(mmshC%face_el(2, max(mmshC%n_face, 1)), mmshC%face_nel(max(mmshC%n_face, 1)))
+    allocate(mmshC%face_anchor(4, max(mmshC%n_face, 1)))
     allocate(mmshC%face_vtx_ptr(mmshC%n_face + 1), mmshC%face_edge_ptr(mmshC%n_face + 1))
     mmshC%face_vtx_ptr(1) = 0
     mmshC%face_edge_ptr(1) = 0
+    mmshC%face_el = 0   ! defensive: a boundary face (nel=1) never writes slot 2
     do k = 1, this%n_mface
        if (.not. face_keep(k)) cycle
        cnt = 0
@@ -928,6 +949,7 @@ contains
        mmshC%face_edge_ptr(fidx(k) + 1) = mmshC%face_edge_ptr(fidx(k)) &
             + size(this%mface(k)%bnd_medge)
        mmshC%face_nel(fidx(k)) = 0
+       mmshC%face_anchor(:, fidx(k)) = this%mface(k)%anchor
        l1 = this%mface(k)%label(1); l2 = this%mface(k)%label(2)
        if (l1 .gt. owned_lo .and. l1 .le. owned_hi) then
           mmshC%face_nel(fidx(k)) = mmshC%face_nel(fidx(k)) + 1
@@ -1120,14 +1142,22 @@ contains
   !! amge_coarsen.f90) must be shipped over and grafted on, not
   !! recomputed.
   !!
-  !! Splicing works by identity, not by re-derivation: a face's identity
-  !! is its (global-id) vertex SET, an edge's is its vertex PAIR. Ghost
-  !! faces/edges are matched against the local mesh's own tables (and
-  !! against each other, in case two ghost elements from possibly
-  !! different ranks are mutually adjacent) purely by that identity; a
-  !! match against a local face with face_nel==1 is exactly the case
-  !! this whole mechanism exists for -- a facet that looked like a
-  !! physical boundary locally turns out to have a real neighbor.
+  !! Splicing works by lineage-anchor identity, not by re-derivation or by
+  !! a face/edge's own (possibly eroded) vertex set. A macroface's/
+  !! macroedge's OWN vertex-set/chain-endpoints shrink as coarsening
+  !! keeps fewer macrovertices, to the point that two physically
+  !! DIFFERENT faces/edges can end up bounded by the identical (eroded)
+  !! set -- so that set cannot be used as a matching key above level 0.
+  !! Instead every face/edge carries a lineage anchor (face_anchor/
+  !! edge_anchor, see macro_mesh_t) -- the lexicographically smallest
+  !! level-0 facet/edge (an unambiguous, never-eroding global-id tuple)
+  !! ever merged into it -- and ghost faces/edges are matched against the
+  !! local mesh's own tables (and against each other, in case two ghost
+  !! elements from possibly different ranks are mutually adjacent) by
+  !! that anchor. A match against a local face with face_nel==1 is
+  !! exactly the case this whole mechanism exists for -- a facet that
+  !! looked like a physical boundary locally turns out to have a real
+  !! neighbor.
   !!
   !! Ghost elements are appended as new elements
   !! [mmsh%n_elem+1, mmsh%n_elem+n_ghost] in the element-index space
@@ -1139,30 +1169,38 @@ contains
   !! @param g_face_ptr        (n_ghost+1) CSR: faces per ghost element
   !! @param g_fv_ptr/idx      CSR (over the flat ghost-face list): global
   !!                          vertex ids per ghost face
+  !! @param g_face_anchor     (4, n_gf) lineage anchor per ghost face, in
+  !!                          g_face_ptr order
   !! @param g_fe_ptr          CSR (over the flat ghost-face list): bounding
   !!                          edges per ghost face
   !! @param g_fe_vtx          (2, *) global vertex id endpoints, one pair
   !!                          per bounding edge, in g_fe_ptr order
+  !! @param g_fe_anchor       (2, *) lineage anchor per bounding edge,
+  !!                          parallel to g_fe_vtx
   subroutine macro_mesh_splice_ghost(mmsh, n_ghost, g_vtx_ptr, g_vtx_idx, &
-       g_face_ptr, g_fv_ptr, g_fv_idx, g_fe_ptr, g_fe_vtx, mmsh_ext)
+       g_face_ptr, g_fv_ptr, g_fv_idx, g_face_anchor, g_fe_ptr, g_fe_vtx, &
+       g_fe_anchor, mmsh_ext)
     type(macro_mesh_t), intent(in) :: mmsh
     integer(i4), intent(in) :: n_ghost
     integer(i4), intent(in) :: g_vtx_ptr(:), g_vtx_idx(:)
     integer(i4), intent(in) :: g_face_ptr(:), g_fv_ptr(:), g_fv_idx(:)
+    integer(i4), intent(in) :: g_face_anchor(:,:)
     integer(i4), intent(in) :: g_fe_ptr(:)
     integer(i4), intent(in) :: g_fe_vtx(:,:)
+    integer(i4), intent(in) :: g_fe_anchor(:,:)
     type(macro_mesh_t), intent(inout) :: mmsh_ext
 
     integer(i4), allocatable :: g2l(:)
     integer(i4), allocatable :: vert_id2(:)
     logical, allocatable :: shared_vtx2(:)
-    type(vset_map_t) :: fmap
+    type(tuple_map_t) :: fmap
     type(tuple_map_t) :: emap
     integer(i4), allocatable :: face_el2(:,:), face_nel2(:)
+    integer(i4), allocatable :: face_anchor2(:,:), edge_anchor2(:,:)
     integer(i4), allocatable :: face_vtx_ptr2(:), face_vtx_idx2(:)
     integer(i4), allocatable :: face_edge_ptr2(:), face_edge_idx2(:)
     integer(i4), allocatable :: edge_vtx2(:,:)
-    integer(i4), allocatable :: verts_loc(:), key(:)
+    integer(i4), allocatable :: verts_loc(:)
     integer(i4) :: n_gf, n_gvref, n_geref, n_gfvref
     integer(i4) :: max_gid, nv_ext, nf, ne, pos_fv, pos_fe
     integer(i4) :: e, f, g, ge, j, k, nvf, nef, val, pr(2)
@@ -1201,20 +1239,24 @@ contains
        end if
     end do
 
-    ! ---------------- edges: seed with the local mesh's own edges -----
+    ! ---------------- edges: seed with the local mesh's own edges, ----
+    ! keyed by lineage anchor, not the (possibly eroded) chain endpoints
     call tmap_init(emap, mmsh%n_edge + n_geref)
     allocate(edge_vtx2(2, mmsh%n_edge + n_geref))
+    allocate(edge_anchor2(2, mmsh%n_edge + n_geref))
     do g = 1, mmsh%n_edge
-       pr = mmsh%edge_vtx(:, g)
-       call sort2(pr)
-       call tmap_find_or_add(emap, [pr(1), pr(2), 0, 0], g, val)
+       call tmap_find_or_add(emap, &
+            [mmsh%edge_anchor(1, g), mmsh%edge_anchor(2, g), 0, 0], g, val)
        edge_vtx2(:, g) = mmsh%edge_vtx(:, g)
+       edge_anchor2(:, g) = mmsh%edge_anchor(:, g)
     end do
     ne = mmsh%n_edge
 
-    ! ---------------- faces: seed with the local mesh's own faces -----
-    call vmap_init(fmap, mmsh%n_face + n_gf)
+    ! ---------------- faces: seed with the local mesh's own faces, ----
+    ! keyed by lineage anchor, not the (possibly eroded) corner-vertex set
+    call tmap_init(fmap, mmsh%n_face + n_gf)
     allocate(face_el2(2, mmsh%n_face + n_gf), face_nel2(mmsh%n_face + n_gf))
+    allocate(face_anchor2(4, mmsh%n_face + n_gf))
     allocate(face_vtx_ptr2(mmsh%n_face + n_gf + 1))
     allocate(face_edge_ptr2(mmsh%n_face + n_gf + 1))
     allocate(face_vtx_idx2(mmsh%face_vtx_ptr(mmsh%n_face + 1) + n_gfvref))
@@ -1224,6 +1266,7 @@ contains
     do f = 1, mmsh%n_face
        face_nel2(f) = mmsh%face_nel(f)
        face_el2(:, f) = mmsh%face_el(:, f)
+       face_anchor2(:, f) = mmsh%face_anchor(:, f)
        nvf = mmsh%face_vtx_ptr(f + 1) - mmsh%face_vtx_ptr(f)
        face_vtx_ptr2(f + 1) = face_vtx_ptr2(f) + nvf
        face_vtx_idx2(face_vtx_ptr2(f) + 1 : face_vtx_ptr2(f + 1)) = &
@@ -1232,11 +1275,7 @@ contains
        face_edge_ptr2(f + 1) = face_edge_ptr2(f) + nef
        face_edge_idx2(face_edge_ptr2(f) + 1 : face_edge_ptr2(f + 1)) = &
             mmsh%face_edge_idx(mmsh%face_edge_ptr(f) + 1 : mmsh%face_edge_ptr(f + 1))
-       allocate(key(mmsh%face_vtx_ptr(f + 1) - mmsh%face_vtx_ptr(f)))
-       key = mmsh%face_vtx_idx(mmsh%face_vtx_ptr(f) + 1 : mmsh%face_vtx_ptr(f + 1))
-       call sort_i4_local(key)
-       call vmap_find_or_add(fmap, key, f, val)
-       deallocate(key)
+       call tmap_find_or_add(fmap, mmsh%face_anchor(:, f), f, val)
     end do
     nf = mmsh%n_face
     pos_fv = mmsh%face_vtx_ptr(mmsh%n_face + 1)
@@ -1250,13 +1289,11 @@ contains
           do k = 1, nvf
              verts_loc(k) = g2l(g_fv_idx(g_fv_ptr(j) + k))
           end do
-          allocate(key(nvf))
-          key = verts_loc
-          call sort_i4_local(key)
-          call vmap_find_or_add(fmap, key, nf + 1, val)
+          call tmap_find_or_add(fmap, g_face_anchor(:, j), nf + 1, val)
           if (val .eq. nf + 1) then
              ! brand new face: register its vertex/edge content
              nf = val
+             face_anchor2(:, nf) = g_face_anchor(:, j)
              face_vtx_ptr2(nf + 1) = face_vtx_ptr2(nf) + nvf
              face_vtx_idx2(face_vtx_ptr2(nf) + 1 : face_vtx_ptr2(nf + 1)) = verts_loc
              nef = g_fe_ptr(j + 1) - g_fe_ptr(j)
@@ -1264,11 +1301,13 @@ contains
              do k = 1, nef
                 pr(1) = g2l(g_fe_vtx(1, g_fe_ptr(j) + k))
                 pr(2) = g2l(g_fe_vtx(2, g_fe_ptr(j) + k))
-                call sort2(pr)
-                call tmap_find_or_add(emap, [pr(1), pr(2), 0, 0], ne + 1, val)
+                call tmap_find_or_add(emap, &
+                     [g_fe_anchor(1, g_fe_ptr(j) + k), &
+                      g_fe_anchor(2, g_fe_ptr(j) + k), 0, 0], ne + 1, val)
                 if (val .eq. ne + 1) then
                    ne = val
                    edge_vtx2(:, ne) = pr
+                   edge_anchor2(:, ne) = g_fe_anchor(:, g_fe_ptr(j) + k)
                 end if
                 face_edge_idx2(face_edge_ptr2(nf) + k) = val
              end do
@@ -1286,7 +1325,7 @@ contains
              face_nel2(val) = 2
              face_el2(2, val) = mmsh%n_elem + ge
           end if
-          deallocate(verts_loc, key)
+          deallocate(verts_loc)
        end do
     end do
 
@@ -1297,14 +1336,16 @@ contains
     mmsh_ext%vert_id = vert_id2(1:nv_ext)
     mmsh_ext%shared_vtx = shared_vtx2(1:nv_ext)
     mmsh_ext%edge_vtx = edge_vtx2(:, 1:ne)
+    mmsh_ext%edge_anchor = edge_anchor2(:, 1:ne)
     mmsh_ext%face_el = face_el2(:, 1:nf)
     mmsh_ext%face_nel = face_nel2(1:nf)
+    mmsh_ext%face_anchor = face_anchor2(:, 1:nf)
     mmsh_ext%face_vtx_ptr = face_vtx_ptr2(1:nf + 1)
     mmsh_ext%face_vtx_idx = face_vtx_idx2(1:pos_fv)
     mmsh_ext%face_edge_ptr = face_edge_ptr2(1:nf + 1)
     mmsh_ext%face_edge_idx = face_edge_idx2(1:pos_fe)
 
-    call vmap_free(fmap)
+    call tmap_free(fmap)
     call tmap_free(emap)
   end subroutine macro_mesh_splice_ghost
 
@@ -1318,6 +1359,8 @@ contains
     if (allocated(this%edge_vtx)) deallocate(this%edge_vtx)
     if (allocated(this%face_el)) deallocate(this%face_el)
     if (allocated(this%face_nel)) deallocate(this%face_nel)
+    if (allocated(this%face_anchor)) deallocate(this%face_anchor)
+    if (allocated(this%edge_anchor)) deallocate(this%edge_anchor)
     if (allocated(this%elm_loc_face)) deallocate(this%elm_loc_face)
     if (allocated(this%vert_id)) deallocate(this%vert_id)
     if (allocated(this%shared_vtx)) deallocate(this%shared_vtx)
@@ -1464,85 +1507,30 @@ contains
     end do
   end subroutine tmap_find_or_add
 
-  ! ---- variable-length sorted-vertex-set map (see vset_map_t) ----
-  subroutine vmap_init(map, cap_hint)
-    type(vset_map_t), intent(inout) :: map
-    integer(i4), intent(in) :: cap_hint
-    map%cap = 2 * cap_hint + 17
-    allocate(map%keys(map%cap), map%val(map%cap))
-    map%n = 0
-  end subroutine vmap_init
-
-  subroutine vmap_free(map)
-    type(vset_map_t), intent(inout) :: map
-    integer(i4) :: i
-    if (allocated(map%keys)) then
-       do i = 1, map%cap
-          if (allocated(map%keys(i)%v)) deallocate(map%keys(i)%v)
-       end do
-       deallocate(map%keys)
-    end if
-    if (allocated(map%val)) deallocate(map%val)
-    map%cap = 0; map%n = 0
-  end subroutine vmap_free
-
-  !> key must already be sorted ascending. Find; if absent and
-  !! new_val >= 0, insert with new_val. Returns the stored value, or -1
-  !! if absent and new_val < 0.
-  subroutine vmap_find_or_add(map, key, new_val, val)
-    type(vset_map_t), intent(inout) :: map
-    integer(i4), intent(in) :: key(:), new_val
-    integer(i4), intent(out) :: val
-    integer(i8) :: h
-    integer(i4) :: s, probe
-
-    h = 1469598103934665603_i8
-    h = ieor(h, int(size(key), i8)) * 1099511628211_i8
-    do s = 1, size(key)
-       h = ieor(h, int(key(s), i8)) * 1099511628211_i8
-    end do
-    probe = int(modulo(h, int(map%cap, i8)), i4) + 1
-    do
-       if (.not. allocated(map%keys(probe)%v)) then
-          if (new_val .lt. 0) then
-             val = -1
-             return
+  !> Lexicographically smallest of the n-tuples anchor(1:n, ids(:)) --
+  !! used to reduce a macroedge's/macroface's lineage anchor from its
+  !! constituent (previous-level) edges'/facets' own anchors. See
+  !! macro_mesh_t%face_anchor for why this exists.
+  pure subroutine min_anchor(anchor, ids, n, m)
+    integer(i4), intent(in) :: anchor(:,:)
+    integer(i4), intent(in) :: ids(:)
+    integer(i4), intent(in) :: n
+    integer(i4), intent(out) :: m(n)
+    integer(i4) :: i, k
+    logical :: lt
+    m = anchor(1:n, ids(1))
+    do i = 2, size(ids)
+       lt = .false.
+       do k = 1, n
+          if (anchor(k, ids(i)) .lt. m(k)) then
+             lt = .true.; exit
+          else if (anchor(k, ids(i)) .gt. m(k)) then
+             exit
           end if
-          if (map%n .ge. map%cap / 2) &
-               call neko_error('macro_topology: vertex-set map over half full')
-          map%keys(probe)%v = key
-          map%val(probe) = new_val
-          map%n = map%n + 1
-          val = new_val
-          return
-       end if
-       if (size(map%keys(probe)%v) .eq. size(key)) then
-          if (all(map%keys(probe)%v .eq. key)) then
-             val = map%val(probe)
-             return
-          end if
-       end if
-       probe = probe + 1
-       if (probe .gt. map%cap) probe = 1
-    end do
-  end subroutine vmap_find_or_add
-
-  !> Insertion sort for a variable-length key array (small arrays only --
-  !! macrofaces/ghost element vertex counts, not fine dof counts).
-  pure subroutine sort_i4_local(a)
-    integer(i4), intent(inout) :: a(:)
-    integer(i4) :: i, j, t
-    do i = 2, size(a)
-       t = a(i)
-       j = i - 1
-       do while (j .ge. 1)
-          if (a(j) .le. t) exit
-          a(j + 1) = a(j)
-          j = j - 1
        end do
-       a(j + 1) = t
+       if (lt) m = anchor(1:n, ids(i))
     end do
-  end subroutine sort_i4_local
+  end subroutine min_anchor
 
   ! ---- small sorts ----
   pure subroutine sort2(a)

@@ -40,11 +40,14 @@
 !! below (macro_topology_t%build_next_level[_owned]). So instead of
 !! shipping a ghost element's raw vertex list and re-deriving its
 !! topology, each element being ghosted ships its OWN already-computed
-!! face/edge sub-tables (see build_ghost_payload_local in
-!! amge_coarsen.f90, which extracts them from that level's own mmsh) and
-!! the receiver grafts them onto its own mesh by vertex-set/vertex-pair
-!! IDENTITY (see macro_mesh_splice_ghost in amge_topology.f90), never by
-!! re-deriving structure from a template. This subsumes the finest-level
+!! face/edge sub-tables, INCLUDING each face's/edge's lineage anchor (see
+!! build_ghost_payload_local in amge_coarsen.f90, which extracts them
+!! from that level's own mmsh) and the receiver grafts them onto its own
+!! mesh by that anchor's IDENTITY (see macro_mesh_splice_ghost in
+!! amge_topology.f90 and macro_mesh_t%face_anchor/edge_anchor for why a
+!! face's/edge's own vertex set isn't a reliable identity above level
+!! 0), never by re-deriving structure from a template. This subsumes
+!! the finest-level
 !! hex case too (nc=8, template already baked into lvl(0)%mmsh) -- there
 !! is only one code path, for every level.
 !!
@@ -83,12 +86,21 @@ module amge_ghost
      !! per face
      integer(i4), allocatable :: face_vtx_ptr(:)
      integer(i4), allocatable :: face_vtx_idx(:)
+     !> (4, n_faces), over the flat face-slot list: each face's lineage
+     !! anchor (see macro_mesh_t%face_anchor in amge_topology.f90) --
+     !! what macro_mesh_splice_ghost actually matches faces on, since the
+     !! vertex set above erodes and is no longer a reliable identity past
+     !! level 0.
+     integer(i4), allocatable :: face_anchor(:,:)
      !> CSR (n_faces+1), over the flat face-slot list: bounding edges per
      !! face, given as global vertex-id endpoint PAIRS (edges have no
      !! separate identity of their own on the wire -- identity is a
      !! vertex pair, established on receipt)
      integer(i4), allocatable :: face_edge_ptr(:)
      integer(i4), allocatable :: face_edge_vtx(:,:)  !< (2, *)
+     !> (2, *), parallel to face_edge_vtx: each bounding edge's lineage
+     !! anchor (see macro_mesh_t%edge_anchor).
+     integer(i4), allocatable :: face_edge_anchor(:,:)
      integer(i4), allocatable :: gmacro(:)         !< (n_ghost) global macro id
      !> CSR (n_ghost+1): flattened local matrix per ghost element
      !! (row-major/column-major matches matrix_t%x's own storage, size
@@ -110,21 +122,29 @@ contains
   !!                        face-slot list)
   !! @param face_vtx_ptr/idx  CSR, over the flat face-slot list: global
   !!                        vertex ids per face
+  !! @param face_anchor     (4, *), over the flat face-slot list: each
+  !!                        face's lineage anchor (see
+  !!                        macro_mesh_t%face_anchor)
   !! @param face_edge_ptr/vtx  CSR, over the flat face-slot list:
   !!                        bounding-edge global vertex-id pairs per face
+  !! @param face_edge_anchor  (2, *), parallel to face_edge_vtx: each
+  !!                        bounding edge's lineage anchor
   !! @param amat_ptr/amat   CSR (nelv+1): flattened local matrix per
   !!                        local element
   !! @param part_local      (nelv) my LOCAL macro ids, 1..n_macro_local
   !! @param n_macro_local   number of macroelements I own
   !! @param gh              result
   subroutine amge_ghost_exchange(comm, vtx_ptr, vtx_idx, &
-       face_ptr, face_vtx_ptr, face_vtx_idx, face_edge_ptr, face_edge_vtx, &
-       amat_ptr, amat, part_local, n_macro_local, gh)
+       face_ptr, face_vtx_ptr, face_vtx_idx, face_anchor, face_edge_ptr, &
+       face_edge_vtx, face_edge_anchor, amat_ptr, amat, part_local, &
+       n_macro_local, gh)
     integer, intent(in) :: comm
     integer(i4), intent(in) :: vtx_ptr(:), vtx_idx(:)
     integer(i4), intent(in) :: face_ptr(:), face_vtx_ptr(:), face_vtx_idx(:)
+    integer(i4), intent(in) :: face_anchor(:,:)
     integer(i4), intent(in) :: face_edge_ptr(:)
     integer(i4), intent(in) :: face_edge_vtx(:,:)
+    integer(i4), intent(in) :: face_edge_anchor(:,:)
     integer(i4), intent(in) :: amat_ptr(:)
     real(rp), intent(in) :: amat(:)
     integer(i4), intent(in) :: part_local(:), n_macro_local
@@ -325,12 +345,17 @@ contains
              eints(idsp(p+1) + pos_i + 2 : idsp(p+1) + pos_i + 1 + nvf) = &
                   face_vtx_idx(face_vtx_ptr(a) + 1 : face_vtx_ptr(a + 1))
              pos_i = pos_i + 1 + nvf
+             eints(idsp(p+1) + pos_i + 1 : idsp(p+1) + pos_i + 4) = face_anchor(:, a)
+             pos_i = pos_i + 4
              nef = face_edge_ptr(a + 1) - face_edge_ptr(a)
              eints(idsp(p+1) + pos_i + 1) = nef
              pos_i = pos_i + 1
              do k = 1, nef
                 eints(idsp(p+1) + pos_i + 1) = face_edge_vtx(1, face_edge_ptr(a) + k)
                 eints(idsp(p+1) + pos_i + 2) = face_edge_vtx(2, face_edge_ptr(a) + k)
+                pos_i = pos_i + 2
+                eints(idsp(p+1) + pos_i + 1) = face_edge_anchor(1, face_edge_ptr(a) + k)
+                eints(idsp(p+1) + pos_i + 2) = face_edge_anchor(2, face_edge_ptr(a) + k)
                 pos_i = pos_i + 2
              end do
           end do
@@ -360,10 +385,10 @@ contains
        do a = 1, gf
           nvf = rints(pi + 1)
           n_gfvref_tot = n_gfvref_tot + nvf
-          pi = pi + 1 + nvf
+          pi = pi + 1 + nvf + 4   ! + face_anchor
           nef = rints(pi + 1)
           n_geref_tot = n_geref_tot + nef
-          pi = pi + 1 + 2 * nef
+          pi = pi + 1 + 4 * nef   ! edge_vtx pair + edge_anchor, per edge
        end do
        pi = pi + 1  ! gmacro
     end do
@@ -373,7 +398,9 @@ contains
     allocate(gh%vtx_idx(max(n_gvref_tot, 1)))
     allocate(gh%face_vtx_ptr(n_gf_tot + 1), gh%face_edge_ptr(n_gf_tot + 1))
     allocate(gh%face_vtx_idx(max(n_gfvref_tot, 1)))
+    allocate(gh%face_anchor(4, max(n_gf_tot, 1)))
     allocate(gh%face_edge_vtx(2, max(n_geref_tot, 1)))
+    allocate(gh%face_edge_anchor(2, max(n_geref_tot, 1)))
     allocate(gh%amat(max(sum(rrcnt), 1)))
     gh%vtx_ptr(1) = 0; gh%face_ptr(1) = 0; gh%amat_ptr(1) = 0
     gh%face_vtx_ptr(1) = 0; gh%face_edge_ptr(1) = 0
@@ -395,12 +422,17 @@ contains
           gh%face_vtx_idx(gh%face_vtx_ptr(gidx) + 1 : gh%face_vtx_ptr(gidx + 1)) = &
                rints(pi + 2 : pi + 1 + nvf)
           pi = pi + 1 + nvf
+          gh%face_anchor(:, gidx) = rints(pi + 1 : pi + 4)
+          pi = pi + 4
           nef = rints(pi + 1)
           gh%face_edge_ptr(gidx + 1) = gh%face_edge_ptr(gidx) + nef
           pi = pi + 1
           do k = 1, nef
              gh%face_edge_vtx(1, gh%face_edge_ptr(gidx) + k) = rints(pi + 1)
              gh%face_edge_vtx(2, gh%face_edge_ptr(gidx) + k) = rints(pi + 2)
+             pi = pi + 2
+             gh%face_edge_anchor(1, gh%face_edge_ptr(gidx) + k) = rints(pi + 1)
+             gh%face_edge_anchor(2, gh%face_edge_ptr(gidx) + k) = rints(pi + 2)
              pi = pi + 2
           end do
        end do
@@ -441,8 +473,9 @@ contains
       integer(i4) :: aa
       len_ = 2 + (vtx_ptr(e + 1) - vtx_ptr(e)) + 1  ! nv_e, verts, nf_e, gmacro
       do aa = face_ptr(e) + 1, face_ptr(e + 1)
-         len_ = len_ + 2 + (face_vtx_ptr(aa + 1) - face_vtx_ptr(aa)) + &
-              2 * (face_edge_ptr(aa + 1) - face_edge_ptr(aa))
+         ! nvf, verts, face_anchor(4), nef, per-edge (vtx pair + anchor)
+         len_ = len_ + 2 + 4 + (face_vtx_ptr(aa + 1) - face_vtx_ptr(aa)) + &
+              4 * (face_edge_ptr(aa + 1) - face_edge_ptr(aa))
       end do
     end function elem_int_len
 
@@ -487,8 +520,10 @@ contains
     if (allocated(this%face_ptr)) deallocate(this%face_ptr)
     if (allocated(this%face_vtx_ptr)) deallocate(this%face_vtx_ptr)
     if (allocated(this%face_vtx_idx)) deallocate(this%face_vtx_idx)
+    if (allocated(this%face_anchor)) deallocate(this%face_anchor)
     if (allocated(this%face_edge_ptr)) deallocate(this%face_edge_ptr)
     if (allocated(this%face_edge_vtx)) deallocate(this%face_edge_vtx)
+    if (allocated(this%face_edge_anchor)) deallocate(this%face_edge_anchor)
     if (allocated(this%gmacro)) deallocate(this%gmacro)
     if (allocated(this%amat_ptr)) deallocate(this%amat_ptr)
     if (allocated(this%amat)) deallocate(this%amat)
